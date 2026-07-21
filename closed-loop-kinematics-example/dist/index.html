@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Closed-Loop Kinematics — Pinocchio-js + Three.js</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #111; color: #eee; font-family: 'Segoe UI', system-ui, sans-serif; }
+    #status-bar {
+      position: absolute; top: 0; left: 0; right: 0;
+      padding: 0.75rem 1.25rem;
+      background: rgba(0,0,0,0.75);
+      display: flex; align-items: center; gap: 0.75rem;
+      font-size: 0.9rem; z-index: 10;
+      pointer-events: none;
+    }
+    #status-bar .dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #666; flex-shrink: 0;
+    }
+    #status-bar .dot.ok    { background: #4caf50; }
+    #status-bar .dot.err   { background: #f44336; }
+    #status-bar .dot.busy  { background: #ff9800; animation: pulse 0.8s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+    #status-bar .msg { flex: 1; }
+    #canvas-container { width: 100%; height: 100%; }
+    #controls {
+      position: absolute; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 1.5rem; padding: 1rem 1.5rem;
+      background: rgba(0,0,0,0.7); border-radius: 8px;
+      backdrop-filter: blur(4px); z-index: 10;
+    }
+    .slider-group {
+      display: flex; flex-direction: column; align-items: center; gap: 0.25rem;
+      min-width: 80px;
+    }
+    .slider-group label {
+      font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .slider-group label.br-a { color: #e74c3c; }
+    .slider-group label.br-b { color: #3498db; }
+    .partition-toggle {
+      display: inline-block;
+      width: 14px; height: 14px;
+      line-height: 14px;
+      text-align: center;
+      font-size: 0.55rem;
+      font-weight: 700;
+      border-radius: 3px;
+      cursor: pointer;
+      margin-left: 4px;
+      vertical-align: middle;
+      user-select: none;
+      transition: background 0.15s, color 0.15s;
+    }
+    .partition-toggle.independent {
+      background: #555;
+      color: #999;
+    }
+    .partition-toggle.independent::after { content: "I"; }
+    .partition-toggle.solver-adjustable {
+      background: #4caf50;
+      color: #111;
+    }
+    .partition-toggle.solver-adjustable::after { content: "S"; }
+    .slider-group input[type="range"] {
+      width: 100%; height: 4px; -webkit-appearance: none; appearance: none;
+      background: #555; border-radius: 2px; outline: none;
+      cursor: pointer;
+    }
+    .slider-group input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: #eee; border: none; cursor: pointer;
+    }
+    .slider-group .value {
+      font-size: 0.7rem; color: #999; font-variant-numeric: tabular-nums;
+    }
+
+    #residual-panel {
+      position: absolute; top: 3.5rem; right: 1rem;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-size: 0.8rem;
+      min-width: 160px;
+      z-index: 10;
+      font-variant-numeric: tabular-nums;
+    }
+    #residual-panel .title {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #888;
+      margin-bottom: 0.4rem;
+    }
+    .residual-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 0.1rem 0;
+    }
+    .residual-row .label { color: #999; }
+    .residual-row .value { font-family: 'Consolas', 'Courier New', monospace; }
+    .residual-closed { color: #4caf50; }
+    .residual-violated { color: #f44336; }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      margin-top: 0.3rem;
+      font-size: 0.7rem;
+      color: #999;
+    }
+    .toggle-row input[type="checkbox"] {
+      accent-color: #4caf50;
+      cursor: pointer;
+    }
+    .toggle-row label {
+      cursor: pointer;
+    }
+
+    #solver-panel {
+      position: absolute; top: 3.5rem; left: 1rem;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-size: 0.8rem;
+      min-width: 180px;
+      z-index: 10;
+    }
+    #solver-panel .title {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #888;
+      margin-bottom: 0.4rem;
+    }
+    .solver-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.15rem 0;
+      font-size: 0.75rem;
+    }
+    .solver-row .label { color: #999; }
+    .solver-row .value { font-family: 'Consolas', 'Courier New', monospace; color: #4caf50; }
+    .solver-row .value.fail { color: #f44336; }
+    .solver-row input[type="number"] {
+      width: 70px;
+      background: #222;
+      border: 1px solid #444;
+      color: #eee;
+      padding: 0.1rem 0.3rem;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      font-family: 'Consolas', 'Courier New', monospace;
+    }
+    .solver-row input[type="number"]:focus {
+      outline: none;
+      border-color: #4caf50;
+    }
+    #btn-project {
+      margin-top: 0.5rem;
+      width: 100%;
+      padding: 0.4rem;
+      background: #4caf50;
+      color: #111;
+      border: none;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 0.75rem;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    #btn-project:hover { background: #66bb6a; }
+    #btn-project:active { background: #388e3c; }
+    #btn-project:disabled {
+      background: #444;
+      color: #777;
+      cursor: not-allowed;
+    }
+
+    .jacobian-row {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      margin-top: 0.3rem;
+      padding-top: 0.3rem;
+      border-top: 1px solid #333;
+      font-size: 0.7rem;
+      color: #999;
+    }
+    .jacobian-row input[type="checkbox"] {
+      accent-color: #4caf50;
+      cursor: pointer;
+    }
+    .jacobian-row label {
+      cursor: pointer;
+    }
+    #jacobian-source-label {
+      font-weight: 600;
+      color: #4caf50;
+    }
+    #jacobian-status {
+      font-weight: 600;
+      color: #4caf50;
+    }
+
+    #geometry-panel {
+      position: absolute; bottom: 5.5rem; right: 1rem;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-size: 0.8rem;
+      min-width: 180px;
+      z-index: 10;
+    }
+    #geometry-panel .title {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #888;
+      margin-bottom: 0.4rem;
+    }
+    .geometry-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.15rem 0;
+      font-size: 0.75rem;
+    }
+    .geometry-row .label {
+      color: #999;
+      white-space: nowrap;
+    }
+    .geometry-row input[type="number"] {
+      width: 60px;
+      background: #222;
+      border: 1px solid #444;
+      color: #eee;
+      padding: 0.1rem 0.3rem;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      font-family: 'Consolas', 'Courier New', monospace;
+    }
+    .geometry-row input[type="number"]:focus {
+      outline: none;
+      border-color: #4caf50;
+    }
+    .geometry-section {
+      margin-top: 0.4rem;
+      border-top: 1px solid #333;
+      padding-top: 0.4rem;
+    }
+    .geometry-section .subtitle {
+      font-size: 0.6rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #666;
+      margin-bottom: 0.2rem;
+    }
+    #btn-reset {
+      margin-top: 0.5rem;
+      width: 100%;
+      padding: 0.4rem;
+      background: #555;
+      color: #eee;
+      border: none;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 0.75rem;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    #btn-reset:hover { background: #666; }
+    #btn-reset:active { background: #444; }
+
+    #mode-panel {
+      position: absolute; top: 3.5rem; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      border-radius: 8px;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.75rem;
+      z-index: 10;
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .mode-btn {
+      padding: 0.3rem 0.6rem;
+      background: #444;
+      color: #aaa;
+      border: 1px solid #555;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .mode-btn:hover { background: #555; color: #eee; }
+    .mode-btn.active {
+      background: #4caf50;
+      color: #111;
+      border-color: #4caf50;
+    }
+    .mode-btn.active.target-ik-mode {
+      background: #ff9800;
+      color: #111;
+      border-color: #ff9800;
+    }
+    .mode-btn.active.force-torque-mode {
+      background: #9c27b0;
+      color: #fff;
+      border-color: #9c27b0;
+    }
+
+    #preset-panel {
+      position: absolute; top: 7rem; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      border-radius: 8px;
+      padding: 0.4rem 0.75rem;
+      font-size: 0.7rem;
+      z-index: 10;
+      display: flex;
+      gap: 0.4rem;
+      align-items: center;
+    }
+    #preset-panel .label {
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 0.6rem;
+    }
+    #preset-select {
+      background: #222;
+      color: #eee;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 0.2rem 0.4rem;
+      font-size: 0.7rem;
+      cursor: pointer;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+    #preset-select:focus {
+      outline: none;
+      border-color: #4caf50;
+    }
+    #preset-description {
+      color: #777;
+      font-size: 0.65rem;
+      max-width: 280px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #btn-load-preset {
+      padding: 0.2rem 0.5rem;
+      background: #4caf50;
+      color: #111;
+      border: none;
+      border-radius: 4px;
+      font-size: 0.65rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    #btn-load-preset:hover { background: #66bb6a; }
+    #btn-load-preset:active { background: #388e3c; }
+
+    #target-ik-panel {
+      position: absolute; bottom: 5.5rem; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      border-radius: 8px;
+      padding: 0.5rem 1rem;
+      font-size: 0.75rem;
+      min-width: 200px;
+      z-index: 10;
+      display: none;
+      font-variant-numeric: tabular-nums;
+    }
+    #force-torque-panel {
+      position: absolute; bottom: 5.5rem; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.85);
+      backdrop-filter: blur(4px);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-size: 0.8rem;
+      min-width: 220px;
+      z-index: 10;
+      font-variant-numeric: tabular-nums;
+    }
+    #force-torque-panel .title {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #9c27b0;
+      margin-bottom: 0.4rem;
+    }
+    #target-ik-panel .title {
+      font-size: 0.6rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #888;
+      margin-bottom: 0.3rem;
+    }
+    .tik-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem;
+      padding: 0.1rem 0;
+    }
+    .tik-row .label { color: #999; }
+    .tik-row .value { font-family: 'Consolas', 'Courier New', monospace; color: #ff9800; }
+    .tik-row .value.converged { color: #4caf50; }
+    .tik-row .value.fail { color: #f44336; }
+    .tik-warning {
+      margin-top: 0.3rem;
+      padding: 0.25rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.65rem;
+      display: none;
+    }
+    .tik-warning.visible { display: block; }
+    .tik-warning.warn-nonconverge {
+      background: rgba(244,67,54,0.15);
+      border: 1px solid #f44336;
+      color: #f44336;
+    }
+    .tik-warning.warn-conditioning {
+      background: rgba(255,152,0,0.15);
+      border: 1px solid #ff9800;
+      color: #ff9800;
+    }
+  </style>
+  <script type="module" crossorigin src="/assets/index-CpMi2nPn.js"></script>
+</head>
+<body>
+  <div id="status-bar">
+    <span class="dot" id="status-dot"></span>
+    <span class="msg" id="status-msg">Initializing…</span>
+  </div>
+  <div id="canvas-container"></div>
+
+  <div id="residual-panel">
+    <div class="title">Closure Residual</div>
+    <div class="residual-row">
+      <span class="label">dx</span>
+      <span class="value" id="residual-dx">—</span>
+    </div>
+    <div class="residual-row">
+      <span class="label">dy</span>
+      <span class="value" id="residual-dy">—</span>
+    </div>
+    <div class="residual-row" id="residual-dz-row" style="display:none">
+      <span class="label">dz</span>
+      <span class="value" id="residual-dz">—</span>
+    </div>
+    <div class="residual-row">
+      <span class="label">norm</span>
+      <span class="value" id="residual-norm">—</span>
+    </div>
+    <div class="toggle-row">
+      <input type="checkbox" id="toggle-dz" />
+      <label for="toggle-dz">Show dz</label>
+    </div>
+    <div class="toggle-row">
+      <input type="checkbox" id="toggle-axes" />
+      <label for="toggle-axes">Frame axes</label>
+    </div>
+  </div>
+
+  <div id="mode-panel">
+    <button class="mode-btn active" data-mode="fk" id="mode-fk">FK</button>
+    <button class="mode-btn" data-mode="project" id="mode-project">Project</button>
+    <button class="mode-btn" data-mode="target-ik" id="mode-target-ik">Target IK</button>
+    <button class="mode-btn" data-mode="force-torque" id="mode-force-torque">Force→Torque</button>
+  </div>
+
+  <div id="preset-panel">
+    <span class="label">Preset</span>
+    <select id="preset-select"></select>
+    <span id="preset-description"></span>
+    <button id="btn-load-preset">Load</button>
+  </div>
+
+  <div id="target-ik-panel">
+    <div class="title">Target IK</div>
+    <div class="tik-row">
+      <span class="label">Target</span>
+      <span class="value" id="tik-target">—</span>
+    </div>
+    <div class="tik-row">
+      <span class="label">Status</span>
+      <span class="value" id="tik-status">—</span>
+    </div>
+    <div class="tik-row">
+      <span class="label">Iterations</span>
+      <span class="value" id="tik-iters">—</span>
+    </div>
+    <div class="tik-row">
+      <span class="label">Residual</span>
+      <span class="value" id="tik-residual">—</span>
+    </div>
+    <div class="tik-row">
+      <span class="label">Time (ms)</span>
+      <span class="value" id="tik-time">—</span>
+    </div>
+    <div class="tik-warning warn-nonconverge" id="tik-nonconverge-warning">
+      ⚠ Target unreachable — solver did not converge within iteration budget
+    </div>
+    <div class="tik-warning warn-conditioning" id="tik-conditioning-warning">
+      ⚠ Near-singular configuration — solver may be less reliable
+    </div>
+    <div class="tik-row" style="margin-top:0.3rem;border-top:1px solid #333;padding-top:0.3rem;">
+      <span class="label">Jacobian</span>
+      <span class="value" id="tik-jacobian-status">Finite Diff.</span>
+    </div>
+  </div>
+
+  <div id="force-torque-panel" style="display:none">
+    <div class="title">Force → Torque</div>
+    <div class="tik-row">
+      <span class="label">Force Fx</span>
+      <input type="number" id="ft-fx" value="1.0" step="0.1" style="width:70px;background:#222;border:1px solid #444;color:#eee;padding:0.1rem 0.3rem;border-radius:4px;font-size:0.7rem;font-family:Consolas,'Courier New',monospace;" />
+    </div>
+    <div class="tik-row">
+      <span class="label">Force Fy</span>
+      <input type="number" id="ft-fy" value="0.0" step="0.1" style="width:70px;background:#222;border:1px solid #444;color:#eee;padding:0.1rem 0.3rem;border-radius:4px;font-size:0.7rem;font-family:Consolas,'Courier New',monospace;" />
+    </div>
+    <div class="tik-row" style="border-top:1px solid #333;padding-top:0.3rem;margin-top:0.3rem;">
+      <span class="label">Closure det</span>
+      <span class="value" id="ft-det" style="color:#9c27b0;">—</span>
+    </div>
+    <div class="tik-row">
+      <span class="label">pC</span>
+      <span class="value" id="ft-pc" style="color:#9c27b0;">—</span>
+    </div>
+    <div class="tik-row" style="border-top:1px solid #333;padding-top:0.3rem;margin-top:0.3rem;">
+      <span class="label" style="font-weight:600;">J_red</span>
+      <span class="value" id="ft-jred" style="color:#9c27b0;font-size:0.6rem;">—</span>
+    </div>
+    <div style="border-top:1px solid #333;padding-top:0.3rem;margin-top:0.3rem;">
+      <div style="font-size:0.6rem;text-transform:uppercase;letter-spacing:0.06em;color:#888;margin-bottom:0.2rem;">Joint Torques</div>
+      <div class="tik-row">
+        <span class="label">τ J1</span>
+        <span class="value" id="ft-tau-J1" style="color:#9c27b0;">—</span>
+      </div>
+      <div class="tik-row">
+        <span class="label">τ J2</span>
+        <span class="value" id="ft-tau-J2" style="color:#9c27b0;">—</span>
+      </div>
+      <div class="tik-row">
+        <span class="label">τ J3</span>
+        <span class="value" id="ft-tau-J3" style="color:#9c27b0;">—</span>
+      </div>
+      <div class="tik-row">
+        <span class="label">τ J4</span>
+        <span class="value" id="ft-tau-J4" style="color:#9c27b0;">—</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="solver-panel">
+    <div class="title">Closure Projection</div>
+    <div class="solver-row">
+      <span class="label">Status</span>
+      <span class="value" id="solve-status">—</span>
+    </div>
+    <div class="solver-row">
+      <span class="label">Iterations</span>
+      <span class="value" id="solve-iters">—</span>
+    </div>
+    <div class="solver-row">
+      <span class="label">Final resid.</span>
+      <span class="value" id="solve-residual">—</span>
+    </div>
+    <div class="solver-row">
+      <span class="label">Time (ms)</span>
+      <span class="value" id="solve-time">—</span>
+    </div>
+    <div id="partition-warning" style="display:none;margin-top:0.3rem;padding:0.3rem 0.4rem;background:rgba(255,152,0,0.2);border:1px solid #ff9800;border-radius:4px;font-size:0.7rem;color:#ff9800;">
+      ⚠ No solver-adjustable joints — projection will not change configuration
+    </div>
+    <div style="margin-top:0.4rem;border-top:1px solid #333;padding-top:0.4rem;">
+      <div class="solver-row">
+        <span class="label">Tolerance</span>
+        <input type="number" id="solver-tolerance" value="1e-6" step="any" min="1e-12" />
+      </div>
+      <div class="solver-row">
+        <span class="label">Damping</span>
+        <input type="number" id="solver-damping" value="1e-6" step="any" min="0" />
+      </div>
+      <div class="solver-row">
+        <span class="label">Max iters</span>
+        <input type="number" id="solver-max-iters" value="50" step="1" min="1" />
+      </div>
+    </div>
+    <div class="jacobian-row">
+      <input type="checkbox" id="toggle-jacobian" />
+      <label for="toggle-jacobian">Use analytic Jacobian</label>
+    </div>
+    <div class="solver-row" style="margin-top:0.2rem;border-top:1px solid #333;padding-top:0.3rem;">
+      <span class="label">Jacobian</span>
+      <span class="value" id="jacobian-status">Finite Diff.</span>
+    </div>
+    <button id="btn-project">Project to Closure</button>
+  </div>
+
+  <div id="geometry-panel">
+    <div class="title">Geometry</div>
+    <div class="geometry-section">
+      <div class="subtitle">Link Lengths</div>
+      <div class="geometry-row">
+        <span class="label">Link 1 (J1→J3)</span>
+        <input type="number" id="geo-link1Length" value="1.0" step="0.05" min="0.1" />
+      </div>
+      <div class="geometry-row">
+        <span class="label">Link 2 (J3→C1)</span>
+        <input type="number" id="geo-link2Length" value="1.0" step="0.05" min="0.1" />
+      </div>
+      <div class="geometry-row">
+        <span class="label">Link 3 (J2→J4)</span>
+        <input type="number" id="geo-link3Length" value="1.0" step="0.05" min="0.1" />
+      </div>
+      <div class="geometry-row">
+        <span class="label">Link 4 (J4→C2)</span>
+        <input type="number" id="geo-link4Length" value="1.0" step="0.05" min="0.1" />
+      </div>
+    </div>
+    <div class="geometry-section">
+      <div class="subtitle">Ground Pivots</div>
+      <div class="geometry-row">
+        <span class="label">Pivot 1 X</span>
+        <input type="number" id="geo-pivot1X" value="-0.5" step="0.1" />
+      </div>
+      <div class="geometry-row">
+        <span class="label">Pivot 1 Y</span>
+        <input type="number" id="geo-pivot1Y" value="0.0" step="0.1" />
+      </div>
+      <div class="geometry-row">
+        <span class="label">Pivot 2 X</span>
+        <input type="number" id="geo-pivot2X" value="0.5" step="0.1" />
+      </div>
+      <div class="geometry-row">
+        <span class="label">Pivot 2 Y</span>
+        <input type="number" id="geo-pivot2Y" value="0.0" step="0.1" />
+      </div>
+    </div>
+    <button id="btn-reset">Reset</button>
+  </div>
+
+  <div id="controls">
+    <div class="slider-group">
+      <label class="br-a">J1 <span class="partition-toggle solver-adjustable" data-joint="J1" title="Solver-adjustable — click to toggle"></span></label>
+      <input type="range" id="slider-J1" min="-3.14159" max="3.14159" step="0.001" value="1.047" />
+      <span class="value" id="value-J1">1.047</span>
+    </div>
+    <div class="slider-group">
+      <label class="br-b">J2 <span class="partition-toggle solver-adjustable" data-joint="J2" title="Solver-adjustable — click to toggle"></span></label>
+      <input type="range" id="slider-J2" min="-3.14159" max="3.14159" step="0.001" value="2.094" />
+      <span class="value" id="value-J2">2.094</span>
+    </div>
+    <div class="slider-group">
+      <label class="br-a">J3 <span class="partition-toggle solver-adjustable" data-joint="J3" title="Solver-adjustable — click to toggle"></span></label>
+      <input type="range" id="slider-J3" min="-3.14159" max="3.14159" step="0.001" value="0.524" />
+      <span class="value" id="value-J3">0.524</span>
+    </div>
+    <div class="slider-group">
+      <label class="br-b">J4 <span class="partition-toggle solver-adjustable" data-joint="J4" title="Solver-adjustable — click to toggle"></span></label>
+      <input type="range" id="slider-J4" min="-3.14159" max="3.14159" step="0.001" value="-0.524" />
+      <span class="value" id="value-J4">-0.524</span>
+    </div>
+  </div>
+</body>
+</html>
