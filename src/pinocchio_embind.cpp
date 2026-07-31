@@ -6,10 +6,6 @@
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 
-// Pinocchio WASM config - must be included before pinocchio headers
-// to define missing macros like PINOCCHIO_DEPRECATED_MESSAGE
-#include "pinocchio_config.hpp"
-
 // Pinocchio headers
 #include <pinocchio/fwd.hpp>
 #include <pinocchio/multibody/model.hpp>
