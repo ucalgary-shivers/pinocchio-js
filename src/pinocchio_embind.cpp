@@ -24,6 +24,12 @@
 #include <pinocchio/algorithm/crba.hpp>
 #include <pinocchio/algorithm/energy.hpp>
 #include <pinocchio/multibody/joint/joint-composite.hpp>
+// Constraint & closed-loop kinematics
+#include <pinocchio/algorithm/contact-info.hpp>
+#include <pinocchio/algorithm/contact-cholesky.hpp>
+#include <pinocchio/algorithm/constrained-dynamics.hpp>
+#include <pinocchio/algorithm/proximal.hpp>
+
 
 using namespace emscripten;
 
@@ -40,6 +46,11 @@ using VectorXd  = Eigen::VectorXd;
 using Vector3d   = Eigen::Vector3d;
 using Matrix3d   = Eigen::Matrix3d;
 using MatrixXd   = Eigen::MatrixXd;
+
+using RigidConstraintModel = pinocchio::RigidConstraintModelTpl<double, 0>;
+using RigidConstraintData  = pinocchio::RigidConstraintDataTpl<double, 0>;
+using ContactCholeskyDecomposition = pinocchio::ContactCholeskyDecompositionTpl<double, 0>;
+using ProximalSettings = pinocchio::ProximalSettingsTpl<double>;
 
 // ─── Eigen ↔ JavaScript Helpers ─────────────────────────────────
 
@@ -119,6 +130,16 @@ val matrixXdToJs(const MatrixXd& m) {
     return result;
 }
 
+/**
+ * Convert SE3 to a JS object { translation: Float64Array(3), rotation: Float64Array(9) }.
+ */
+val se3ToJs(const SE3& se3) {
+    val result = val::object();
+    result.set("translation", vector3dToJs(se3.translation()));
+    result.set("rotation", matrixXdToJs(se3.rotation()));
+    return result;
+}
+
 // ─── SE3 Factories ──────────────────────────────────────────────
 
 /**
@@ -134,7 +155,6 @@ SE3 se3FromRotationTranslation(const val& rot, const val& trans) {
 SE3 se3FromXyzRpy(double x, double y, double z,
                   double roll, double pitch, double yaw) {
     Matrix3d R;
-    // ZYX Euler convention (URDF standard: rpy = roll about X, pitch about Y, yaw about Z)
     double cr = cos(roll),  sr = sin(roll);
     double cp = cos(pitch), sp = sin(pitch);
     double cy = cos(yaw),   sy = sin(yaw);
@@ -161,7 +181,6 @@ SE3 se3Identity() {
 Inertia inertiaFromMassComInertia(double mass, const val& com_js, const val& inertia_js) {
     Vector3d com = jsToVector3d(com_js);
 
-    // Symmetric 3x3 inertia matrix from 6 unique elements
     double Ixx = inertia_js[0].as<double>();
     double Ixy = inertia_js[1].as<double>();
     double Ixz = inertia_js[2].as<double>();
@@ -179,10 +198,6 @@ Inertia inertiaFromMassComInertia(double mass, const val& com_js, const val& ine
 
 // ─── Joint Model Factories ──────────────────────────────────────
 
-// Wrapper types to hold joint models for addJoint calls.
-// We need this because Pinocchio's addJoint is templated on the joint model type,
-// but Embind can't handle boost::variant directly.
-
 struct JointModelWrapper {
     enum Type {
         RX, RY, RZ,
@@ -194,7 +209,7 @@ struct JointModelWrapper {
     };
 
     Type type;
-    Vector3d axis;  // Only used for UNALIGNED types
+    Vector3d axis;
 
     JointModelWrapper(Type t) : type(t), axis(Vector3d::UnitX()) {}
     JointModelWrapper(Type t, const Vector3d& a) : type(t), axis(a.normalized()) {}
@@ -218,10 +233,6 @@ JointModelWrapper makeJointModelFixed() { return JointModelWrapper(JointModelWra
 
 // ─── Model Wrapper Functions ────────────────────────────────────
 
-/**
- * Add a joint to the model.
- * Returns the JointIndex of the newly added joint.
- */
 JointIndex modelAddJoint(Model& model,
                          JointIndex parentId,
                          const JointModelWrapper& joint,
@@ -251,7 +262,6 @@ JointIndex modelAddJoint(Model& model,
         case JointModelWrapper::FREE_FLYER:
             return model.addJoint(parentId, pinocchio::JointModelFreeFlyer(), placement, name);
         case JointModelWrapper::FIXED:
-            // Use an empty Composite joint (0 DOFs) to represent a fixed joint in the kinematic tree
             return model.addJoint(parentId,
                 pinocchio::JointModelComposite(0),
                 placement, name);
@@ -260,9 +270,6 @@ JointIndex modelAddJoint(Model& model,
     }
 }
 
-/**
- * Add a joint with limits.
- */
 JointIndex modelAddJointWithLimits(Model& model,
                                    JointIndex parentId,
                                    const JointModelWrapper& joint,
@@ -312,14 +319,152 @@ JointIndex modelAddJointWithLimits(Model& model,
     }
 }
 
-/**
- * Append body inertia to an existing joint.
- */
 void modelAppendBodyToJoint(Model& model,
                             JointIndex jointId,
                             const Inertia& inertia,
                             const SE3& bodyPlacement) {
     model.appendBodyToJoint(jointId, inertia, bodyPlacement);
+}
+
+// ─── RigidConstraintModel Wrapper ────────────────────────────────
+
+// Derive to make the protected default constructor accessible.
+struct RigidConstraintModelEx : public RigidConstraintModel {
+    RigidConstraintModelEx()
+    : RigidConstraintModel() {}
+
+    RigidConstraintModelEx(pinocchio::ContactType type,
+                           const Model& model,
+                           JointIndex joint1_id,
+                           const SE3& joint1_placement,
+                           JointIndex joint2_id,
+                           const SE3& joint2_placement,
+                           pinocchio::ReferenceFrame reference_frame = pinocchio::LOCAL)
+    : RigidConstraintModel(type, model, joint1_id, joint1_placement,
+                           joint2_id, joint2_placement, reference_frame) {}
+
+    RigidConstraintModelEx(pinocchio::ContactType type,
+                           const Model& model,
+                           JointIndex joint1_id,
+                           const SE3& joint1_placement,
+                           pinocchio::ReferenceFrame reference_frame = pinocchio::LOCAL)
+    : RigidConstraintModel(type, model, joint1_id, joint1_placement, reference_frame) {}
+
+    int getSize() const { return size(); }
+
+    pinocchio::ContactType getType() const { return type; }
+    JointIndex getJoint1Id() const { return joint1_id; }
+    JointIndex getJoint2Id() const { return joint2_id; }
+    val getJoint1Placement() const { return se3ToJs(joint1_placement); }
+    val getJoint2Placement() const { return se3ToJs(joint2_placement); }
+    pinocchio::ReferenceFrame getRefFrame() const { return reference_frame; }
+
+    val getCorrectorKp() const { return vectorXdToJs(corrector.Kp); }
+    void setCorrectorKp(const val& kp_js) {
+        VectorXd kp = jsToVectorXd(kp_js);
+        corrector.Kp = kp;
+    }
+
+    val getCorrectorKd() const { return vectorXdToJs(corrector.Kd); }
+    void setCorrectorKd(const val& kd_js) {
+        VectorXd kd = jsToVectorXd(kd_js);
+        corrector.Kd = kd;
+    }
+};
+
+RigidConstraintModelEx* createRigidConstraintModel(pinocchio::ContactType type,
+                                                    const Model& model,
+                                                    JointIndex joint1_id,
+                                                    const SE3& joint1_placement,
+                                                    JointIndex joint2_id,
+                                                    const SE3& joint2_placement,
+                                                    pinocchio::ReferenceFrame reference_frame) {
+    return new RigidConstraintModelEx(type, model, joint1_id, joint1_placement,
+                                      joint2_id, joint2_placement, reference_frame);
+}
+
+// Wrapper for RigidConstraintData — using raw pointer since embind needs a default ctor
+// and the class already has one (public).
+struct RigidConstraintDataEx {
+    RigidConstraintData data;
+
+    RigidConstraintDataEx() : data() {}
+    explicit RigidConstraintDataEx(const RigidConstraintModelEx& model) : data(model) {}
+
+    val getC1Mc2() const {
+        return se3ToJs(data.c1Mc2);
+    }
+
+    val getC1Mc2Translation() const {
+        return vector3dToJs(data.c1Mc2.translation());
+    }
+
+    val getContactForce() const {
+        val result = val::object();
+        result.set("linear", vector3dToJs(data.contact_force.linear()));
+        result.set("angular", vector3dToJs(data.contact_force.angular()));
+        return result;
+    }
+};
+
+RigidConstraintDataEx makeRigidConstraintData(const RigidConstraintModelEx& model) {
+    return RigidConstraintDataEx(model);
+}
+
+// ─── ProximalSettings Wrapper ────────────────────────────────────
+
+ProximalSettings makeProximalSettings(double accuracy, double mu, int maxIter) {
+    return ProximalSettings(accuracy, mu, maxIter);
+}
+
+double proximalGetAbsoluteAccuracy(const ProximalSettings& s) { return s.absolute_accuracy; }
+double proximalGetRelativeAccuracy(const ProximalSettings& s) { return s.relative_accuracy; }
+double proximalGetMu(const ProximalSettings& s) { return s.mu; }
+int proximalGetMaxIter(const ProximalSettings& s) { return s.max_iter; }
+double proximalGetAbsoluteResidual(const ProximalSettings& s) { return s.absolute_residual; }
+double proximalGetRelativeResidual(const ProximalSettings& s) { return s.relative_residual; }
+int proximalGetIter(const ProximalSettings& s) { return s.iter; }
+
+// ─── ContactCholeskyDecomposition Wrapper ────────────────────────
+
+// Wraps ContactCholeskyDecompositionTpl for embind.
+struct ContactCholeskyDecompositionEx {
+    ContactCholeskyDecomposition chol;
+
+    ContactCholeskyDecompositionEx() : chol() {}
+
+    ContactCholeskyDecompositionEx(const Model& model, const RigidConstraintModelEx& cm) : chol() {
+        PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
+        models.push_back(cm);
+        chol.allocate(model, models);
+    }
+
+    void compute(const Model& model, Data& data,
+                 const RigidConstraintModelEx& cm,
+                 RigidConstraintDataEx& cd,
+                 double mu) {
+        PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
+        models.push_back(cm);
+        PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintData) datas;
+        datas.push_back(cd.data);
+        chol.compute(model, data, models, datas, mu);
+        cd.data = datas[0];
+    }
+
+    val solve(const val& rhs_js) {
+        VectorXd rhs = jsToVectorXd(rhs_js);
+        VectorXd result = chol.solve(rhs);
+        return vectorXdToJs(result);
+    }
+
+    int getSize() const { return (int)chol.size(); }
+    int constraintDim() const { return (int)chol.constraintDim(); }
+};
+
+ContactCholeskyDecompositionEx* createContactCholeskyDecomposition(
+    const Model& model,
+    const RigidConstraintModelEx& cm) {
+    return new ContactCholeskyDecompositionEx(model, cm);
 }
 
 // ─── Algorithm Wrappers ─────────────────────────────────────────
@@ -345,7 +490,6 @@ val aba_js(Model& model, Data& data,
 val crba_js(Model& model, Data& data, const val& q_js) {
     VectorXd q = jsToVectorXd(q_js);
     pinocchio::crba(model, data, q);
-    // Pinocchio's crba only fills the upper triangle, we need to symmetrize it
     data.M.triangularView<Eigen::StrictlyLower>() = data.M.transpose().triangularView<Eigen::StrictlyLower>();
     return matrixXdToJs(data.M);
 }
@@ -392,6 +536,13 @@ val getJointJacobian_js(const Model& model, Data& data,
     return matrixXdToJs(J);
 }
 
+val getFrameJacobian_js(const Model& model, Data& data,
+                         JointIndex jointId,
+                         const SE3& placement,
+                         pinocchio::ReferenceFrame refFrame) {
+    return matrixXdToJs(pinocchio::getFrameJacobian(model, data, jointId, placement, refFrame));
+}
+
 void updateFramePlacements_js(Model& model, Data& data) {
     pinocchio::updateFramePlacements(model, data);
 }
@@ -424,6 +575,35 @@ val neutralConfiguration_js(const Model& model) {
     return vectorXdToJs(q);
 }
 
+// ─── Constraint Dynamics Wrappers ────────────────────────────────
+
+void initConstraintDynamics_js(Model& model, Data& data,
+                               const RigidConstraintModelEx& cm) {
+    PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
+    models.push_back(cm);
+    pinocchio::initConstraintDynamics(model, data, models);
+}
+
+val constraintDynamics_js(Model& model, Data& data,
+                          const val& q_js, const val& v_js, const val& tau_js,
+                          const RigidConstraintModelEx& cm,
+                          RigidConstraintDataEx& cd,
+                          ProximalSettings& settings) {
+    VectorXd q = jsToVectorXd(q_js);
+    VectorXd v = jsToVectorXd(v_js);
+    VectorXd tau = jsToVectorXd(tau_js);
+
+    PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
+    models.push_back(cm);
+    PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintData) datas;
+    datas.push_back(cd.data);
+
+    pinocchio::constraintDynamics(model, data, q, v, tau, models, datas, settings);
+    cd.data = datas[0];
+
+    return vectorXdToJs(data.ddq);
+}
+
 // ─── Data accessors ─────────────────────────────────────────────
 
 val dataTau(const Data& data) { return vectorXdToJs(data.tau); }
@@ -432,6 +612,9 @@ val dataNle(const Data& data) { return vectorXdToJs(data.nle); }
 val dataComAt(const Data& data, unsigned idx) {
     return vector3dToJs(data.com[idx]);
 }
+
+val dataDDq(const Data& data) { return vectorXdToJs(data.ddq); }
+val dataLambdaC(const Data& data) { return vectorXdToJs(data.lambda_c); }
 
 // ─── Embind Module ──────────────────────────────────────────────
 
@@ -442,6 +625,13 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
         .value("WORLD", pinocchio::WORLD)
         .value("LOCAL", pinocchio::LOCAL)
         .value("LOCAL_WORLD_ALIGNED", pinocchio::LOCAL_WORLD_ALIGNED)
+        ;
+
+    // ── ContactType enum ──
+    enum_<pinocchio::ContactType>("ContactType")
+        .value("CONTACT_3D", pinocchio::CONTACT_3D)
+        .value("CONTACT_6D", pinocchio::CONTACT_6D)
+        .value("CONTACT_UNDEFINED", pinocchio::CONTACT_UNDEFINED)
         ;
 
     // ── SE3 ──
@@ -459,7 +649,6 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     // ── JointModelWrapper ──
     class_<JointModelWrapper>("JointModel");
 
-    // Joint factories
     function("JointModelRX", &makeJointModelRX);
     function("JointModelRY", &makeJointModelRY);
     function("JointModelRZ", &makeJointModelRZ);
@@ -492,6 +681,56 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     function("getTau", &dataTau);
     function("getNle", &dataNle);
     function("getComAt", &dataComAt);
+    function("getDDq", &dataDDq);
+    function("getLambdaC", &dataLambdaC);
+
+    // ── RigidConstraintModel ──
+    class_<RigidConstraintModelEx>("RigidConstraintModel")
+        .property("type", &RigidConstraintModelEx::getType)
+        .property("joint1_id", &RigidConstraintModelEx::getJoint1Id)
+        .property("joint2_id", &RigidConstraintModelEx::getJoint2Id)
+        .property("joint1_placement", &RigidConstraintModelEx::getJoint1Placement)
+        .property("joint2_placement", &RigidConstraintModelEx::getJoint2Placement)
+        .property("reference_frame", &RigidConstraintModelEx::getRefFrame)
+        .property("size", &RigidConstraintModelEx::getSize)
+        .property("correctorKp", &RigidConstraintModelEx::getCorrectorKp, &RigidConstraintModelEx::setCorrectorKp)
+        .property("correctorKd", &RigidConstraintModelEx::getCorrectorKd, &RigidConstraintModelEx::setCorrectorKd)
+        ;
+
+    function("createRigidConstraintModel", &createRigidConstraintModel, allow_raw_pointers());
+
+    // ── RigidConstraintData ──
+    class_<RigidConstraintDataEx>("RigidConstraintData")
+        .constructor<>()
+        .property("c1Mc2", &RigidConstraintDataEx::getC1Mc2)
+        .property("c1Mc2Translation", &RigidConstraintDataEx::getC1Mc2Translation)
+        .property("contactForce", &RigidConstraintDataEx::getContactForce)
+        ;
+
+    function("createConstraintData", &makeRigidConstraintData);
+
+    // ── ProximalSettings ──
+    class_<ProximalSettings>("ProximalSettings")
+        .constructor<double, double, int>()
+        .property("absolute_accuracy", &proximalGetAbsoluteAccuracy)
+        .property("relative_accuracy", &proximalGetRelativeAccuracy)
+        .property("mu", &proximalGetMu)
+        .property("max_iter", &proximalGetMaxIter)
+        .property("absolute_residual", &proximalGetAbsoluteResidual)
+        .property("relative_residual", &proximalGetRelativeResidual)
+        .property("iter", &proximalGetIter)
+        ;
+
+    // ── ContactCholeskyDecomposition ──
+    class_<ContactCholeskyDecompositionEx>("ContactCholeskyDecomposition")
+        .constructor<>()
+        .function("compute", &ContactCholeskyDecompositionEx::compute)
+        .function("solve", &ContactCholeskyDecompositionEx::solve)
+        .property("size", &ContactCholeskyDecompositionEx::getSize)
+        .property("constraintDim", &ContactCholeskyDecompositionEx::constraintDim)
+        ;
+
+    function("createContactCholeskyDecomposition", &createContactCholeskyDecomposition, allow_raw_pointers());
 
     // ── Algorithms ──
     function("rnea", &rnea_js);
@@ -506,8 +745,13 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     function("getJointPlacement", &getJointPlacement_js);
     function("computeJointJacobians", &computeJointJacobians_js);
     function("getJointJacobian", &getJointJacobian_js);
+    function("getFrameJacobian", &getFrameJacobian_js);
     function("centerOfMass", &centerOfMass_js);
     function("computeTotalMass", &computeTotalMass_js);
     function("randomConfiguration", &randomConfiguration_js);
     function("neutralConfiguration", &neutralConfiguration_js);
+
+    // ── Constraint Algorithms ──
+    function("initConstraintDynamics", &initConstraintDynamics_js);
+    function("constraintDynamics", &constraintDynamics_js);
 }
