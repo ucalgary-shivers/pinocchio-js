@@ -25,6 +25,12 @@
 #include <pinocchio/algorithm/contact-cholesky.hpp>
 #include <pinocchio/algorithm/constrained-dynamics.hpp>
 #include <pinocchio/algorithm/proximal.hpp>
+#include <pinocchio/spatial/explog.hpp>
+#include <Eigen/SVD>
+#include <stdexcept>
+#include <cmath>
+#include <limits>
+#include <string>
 
 
 using namespace emscripten;
@@ -47,6 +53,7 @@ using RigidConstraintModel = pinocchio::RigidConstraintModelTpl<double, 0>;
 using RigidConstraintData  = pinocchio::RigidConstraintDataTpl<double, 0>;
 using ContactCholeskyDecomposition = pinocchio::ContactCholeskyDecompositionTpl<double, 0>;
 using ProximalSettings = pinocchio::ProximalSettingsTpl<double>;
+
 
 // ─── Eigen ↔ JavaScript Helpers ─────────────────────────────────
 
@@ -146,7 +153,14 @@ SE3 se3FromRotationTranslation(const val& rot, const val& trans) {
 }
 
 /**
- * Create SE3 from xyz + rpy (URDF convention: fixed-axis XYZ = roll, pitch, yaw).
+ *  Convert a JS {translation, rotation} placement object to SE3.
+ */
+SE3 se3FromJsPlacement(const val& placement) {
+    return SE3(jsToMatrix3d(placement["rotation"]), jsToVector3d(placement["translation"]));
+}
+
+/**
+ *  Create SE3 from xyz + rpy (URDF convention: fixed-axis XYZ = roll, pitch, yaw).
  */
 SE3 se3FromXyzRpy(double x, double y, double z,
                   double roll, double pitch, double yaw) {
@@ -379,33 +393,192 @@ RigidConstraintModelEx* createRigidConstraintModel(pinocchio::ContactType type,
                                       joint2_id, joint2_placement, reference_frame);
 }
 
-// Wrapper for RigidConstraintData — using raw pointer since embind needs a default ctor
-// and the class already has one (public).
-struct RigidConstraintDataEx {
-    RigidConstraintData data;
+// The set is the ownership boundary for constraint algorithms.  In particular,
+// models are copied on insertion so callers may safely delete their builder
+// handles afterwards.
+struct RigidConstraintSetEx {
+    PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
+    PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintData) datas;
+    unsigned nq, nv, njoints;
+    unsigned revision_;
+    int constraint_dim_;
 
-    RigidConstraintDataEx() : data() {}
-    explicit RigidConstraintDataEx(const RigidConstraintModelEx& model) : data(model) {}
+    explicit RigidConstraintSetEx(const Model& model)
+        : nq(model.nq), nv(model.nv), njoints(model.njoints), revision_(0), constraint_dim_(0) {}
 
-    val getC1Mc2() const {
-        return se3ToJs(data.c1Mc2);
+    static void finitePlacement(const SE3& p, const char* name) {
+        for (int i = 0; i < 3; ++i)
+            if (!std::isfinite(p.translation()[i])) throw std::invalid_argument(std::string(name) + " contains non-finite values");
+        for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c)
+            if (!std::isfinite(p.rotation()(r,c))) throw std::invalid_argument(std::string(name) + " contains non-finite values");
     }
 
-    val getC1Mc2Translation() const {
-        return vector3dToJs(data.c1Mc2.translation());
+    int addConstraint(const RigidConstraintModelEx& input) {
+        if (input.type != pinocchio::CONTACT_3D && input.type != pinocchio::CONTACT_6D)
+            throw std::invalid_argument("RigidConstraintSet supports CONTACT_3D and CONTACT_6D only");
+        if (input.reference_frame == pinocchio::WORLD)
+            throw std::invalid_argument("RigidConstraintSet does not support WORLD reference frame");
+        if (input.joint1_id >= njoints || input.joint2_id >= njoints)
+            throw std::invalid_argument("RigidConstraintModel joint is incompatible with the set topology");
+        finitePlacement(input.joint1_placement, "joint1_placement");
+        finitePlacement(input.joint2_placement, "joint2_placement");
+        if (input.corrector.Kp.size() != input.size() || input.corrector.Kd.size() != input.size())
+            throw std::invalid_argument("RigidConstraintModel corrector dimensions do not match its type");
+        for (int i = 0; i < input.size(); ++i)
+            if (!std::isfinite(input.corrector.Kp[i]) || !std::isfinite(input.corrector.Kd[i]))
+                throw std::invalid_argument("RigidConstraintModel corrector contains non-finite values");
+        models.push_back(input);
+        datas.emplace_back(models.back());
+        constraint_dim_ += models.back().size();
+        ++revision_;
+        return static_cast<int>(models.size() - 1);
     }
 
-    val getContactForce() const {
+    void replaceConstraint(int index, const RigidConstraintModelEx& input) {
+        if (index < 0 || index >= count()) throw std::out_of_range("constraint index out of range");
+        if (input.type != pinocchio::CONTACT_3D && input.type != pinocchio::CONTACT_6D)
+            throw std::invalid_argument("RigidConstraintSet supports CONTACT_3D and CONTACT_6D only");
+        if (input.reference_frame == pinocchio::WORLD)
+            throw std::invalid_argument("RigidConstraintSet does not support WORLD reference frame");
+        if (input.joint1_id >= njoints || input.joint2_id >= njoints)
+            throw std::invalid_argument("RigidConstraintModel joint is incompatible with the set topology");
+        finitePlacement(input.joint1_placement, "joint1_placement");
+        finitePlacement(input.joint2_placement, "joint2_placement");
+        if (input.corrector.Kp.size() != input.size() || input.corrector.Kd.size() != input.size())
+            throw std::invalid_argument("RigidConstraintModel corrector dimensions do not match its type");
+        for (int i = 0; i < input.size(); ++i)
+            if (!std::isfinite(input.corrector.Kp[i]) || !std::isfinite(input.corrector.Kd[i]))
+                throw std::invalid_argument("RigidConstraintModel corrector contains non-finite values");
+        int old_size = models[index].size();
+        models[index] = input;
+        datas[index] = RigidConstraintData(models[index]);
+        constraint_dim_ += models[index].size() - old_size;
+        ++revision_;
+    }
+
+    int count() const { return static_cast<int>(models.size()); }
+    int constraintDim() const { return constraint_dim_; }
+    unsigned revision() const { return revision_; }
+    int rowOffset(int index) const {
+        if (index < 0 || index >= count()) throw std::out_of_range("constraint index out of range");
+        int offset = 0; for (int i = 0; i < index; ++i) offset += models[i].size(); return offset;
+    }
+    val modelInfo(int index) const {
+        if (index < 0 || index >= count()) throw std::out_of_range("constraint index out of range");
+        const auto& m = models[index]; val out = val::object();
+        out.set("index", index); out.set("rowOffset", rowOffset(index)); out.set("rowDim", m.size());
+        out.set("type", m.type); out.set("referenceFrame", m.reference_frame);
+        out.set("joint1Id", m.joint1_id); out.set("joint2Id", m.joint2_id);
+        out.set("joint1Placement", se3ToJs(m.joint1_placement)); out.set("joint2Placement", se3ToJs(m.joint2_placement));
+        out.set("correctorKp", vectorXdToJs(m.corrector.Kp)); out.set("correctorKd", vectorXdToJs(m.corrector.Kd));
+        return out;
+    }
+    val dataInfo(int index) const {
+        if (index < 0 || index >= count()) throw std::out_of_range("constraint index out of range");
+        const auto& d = datas[index]; val out = val::object();
+        out.set("index", index); out.set("rowOffset", rowOffset(index)); out.set("rowDim", models[index].size());
+        out.set("c1Mc2", se3ToJs(d.c1Mc2)); out.set("translation", vector3dToJs(d.c1Mc2.translation()));
+        val force = val::object(); force.set("linear", vector3dToJs(d.contact_force.linear()));
+        force.set("angular", vector3dToJs(d.contact_force.angular())); out.set("contactForce", force); return out;
+    }
+
+    void setConstraintGains(int index, const val& kp_js, const val& kd_js) {
+        if (index < 0 || index >= count()) throw std::out_of_range("constraint index out of range");
+        VectorXd kp = jsToVectorXd(kp_js);
+        VectorXd kd = jsToVectorXd(kd_js);
+        if ((int)kp.size() != models[index].size() || (int)kd.size() != models[index].size())
+            throw std::invalid_argument("gain dimensions must match constraint dimension");
+        for (int i = 0; i < kp.size(); ++i)
+            if (!std::isfinite(kp[i]) || !std::isfinite(kd[i]))
+                throw std::invalid_argument("gains must be finite");
+        models[index].corrector.Kp = kp;
+        models[index].corrector.Kd = kd;
+        ++revision_;
+    }
+
+    val evaluate(const Model& model, Data& data, const val& q_js) {
+        VectorXd q = jsToVectorXd(q_js);
+
+        pinocchio::forwardKinematics(model, data, q);
+        pinocchio::computeJointJacobians(model, data, q);
+
+        int rows = constraint_dim_;
+        int cols = model.nv;
+
+        val residual = val::global("Float64Array").new_(rows);
+        val jacobian = val::global("Float64Array").new_(rows * cols);
+
+        int row_offset = 0;
+        for (int i = 0; i < count(); ++i) {
+            int dim = models[i].size();
+
+            models[i].calc(model, data, datas[i]);
+
+            if (models[i].type == pinocchio::CONTACT_3D) {
+                if (models[i].reference_frame == pinocchio::LOCAL) {
+                    Vector3d r = -datas[i].c1Mc2.translation();
+                    for (int j = 0; j < 3; ++j) residual.set(row_offset + j, val(r[j]));
+                } else {
+                    Vector3d r = datas[i].oMc1.translation() - datas[i].oMc2.translation();
+                    for (int j = 0; j < 3; ++j) residual.set(row_offset + j, val(r[j]));
+                }
+            } else {
+                if (models[i].reference_frame == pinocchio::LOCAL) {
+                    auto motion = pinocchio::log6(datas[i].c1Mc2);
+                    Eigen::Matrix<double,6,1> r = -motion.toVector();
+                    for (int j = 0; j < 6; ++j) residual.set(row_offset + j, val(r[j]));
+                } else {
+                    Vector3d linear = datas[i].oMc1.translation() - datas[i].oMc2.translation();
+                    Matrix3d R_relative = datas[i].oMc2.rotation() * datas[i].oMc1.rotation().transpose();
+                    Vector3d angular = -pinocchio::log3(R_relative);
+                    for (int j = 0; j < 3; ++j) residual.set(row_offset + j, val(linear[j]));
+                    for (int j = 0; j < 3; ++j) residual.set(row_offset + 3 + j, val(angular[j]));
+                }
+            }
+
+            MatrixXd Jc(dim, cols);
+            models[i].jacobian(model, data, datas[i], Jc);
+
+            double sign = (models[i].reference_frame == pinocchio::LOCAL) ? -1.0 : 1.0;
+            for (int col = 0; col < cols; ++col)
+                for (int row = 0; row < dim; ++row)
+                    jacobian.set((row_offset + row) + col * rows, val(sign * Jc(row, col)));
+
+            row_offset += dim;
+        }
+
         val result = val::object();
-        result.set("linear", vector3dToJs(data.contact_force.linear()));
-        result.set("angular", vector3dToJs(data.contact_force.angular()));
+        result.set("residual", residual);
+        result.set("jacobian", jacobian);
+        result.set("rows", rows);
+        result.set("cols", cols);
         return result;
     }
-};
 
-RigidConstraintDataEx makeRigidConstraintData(const RigidConstraintModelEx& model) {
-    return RigidConstraintDataEx(model);
-}
+    void updatePlacements(const val& updates) {
+        int len = updates["length"].as<int>();
+        for (int i = 0; i < len; ++i) {
+            val entry = updates[i];
+            int index = entry["index"].as<int>();
+            if (index < 0 || index >= count())
+                throw std::out_of_range("updatePlacements: constraint index out of range");
+            if (models[index].reference_frame == pinocchio::WORLD)
+                throw std::invalid_argument("RigidConstraintSet does not support WORLD reference frame");
+            val j1p = entry["joint1Placement"];
+            val j2p = entry["joint2Placement"];
+            finitePlacement(se3FromJsPlacement(j1p), "joint1Placement");
+            finitePlacement(se3FromJsPlacement(j2p), "joint2Placement");
+        }
+        for (int i = 0; i < len; ++i) {
+            val entry = updates[i];
+            int index = entry["index"].as<int>();
+            val j1p = entry["joint1Placement"];
+            val j2p = entry["joint2Placement"];
+            models[index].joint1_placement = se3FromJsPlacement(j1p);
+            models[index].joint2_placement = se3FromJsPlacement(j2p);
+        }
+    }
+};
 
 // ─── ProximalSettings Wrapper ────────────────────────────────────
 
@@ -423,28 +596,44 @@ int proximalGetIter(const ProximalSettings& s) { return s.iter; }
 
 // ─── ContactCholeskyDecomposition Wrapper ────────────────────────
 
-// Wraps ContactCholeskyDecompositionTpl for embind.
+// Wraps ContactCholeskyDecompositionTpl for embind.  Accepts a
+// RigidConstraintSet whose owned native model/data vectors are passed
+// directly to Pinocchio.  The decomposition tracks the set revision that
+// was used for allocation and reallocates before computation when
+// structural members have changed.  No set reference is retained.
 struct ContactCholeskyDecompositionEx {
     ContactCholeskyDecomposition chol;
+    unsigned last_revision_;
+    int last_constraint_dim_;
 
-    ContactCholeskyDecompositionEx() : chol() {}
+    ContactCholeskyDecompositionEx() : chol(), last_revision_(0), last_constraint_dim_(0) {}
 
-    ContactCholeskyDecompositionEx(const Model& model, const RigidConstraintModelEx& cm) : chol() {
-        PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
-        models.push_back(cm);
-        chol.allocate(model, models);
+    ContactCholeskyDecompositionEx(const Model& model, const RigidConstraintSetEx& set)
+        : chol(), last_revision_(0), last_constraint_dim_(0) {
+        if (set.count() > 0) {
+            chol.allocate(model, set.models);
+            last_revision_ = set.revision();
+            last_constraint_dim_ = set.constraintDim();
+        }
     }
 
     void compute(const Model& model, Data& data,
-                 const RigidConstraintModelEx& cm,
-                 RigidConstraintDataEx& cd,
+                 RigidConstraintSetEx& set,
                  double mu) {
-        PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
-        models.push_back(cm);
-        PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintData) datas;
-        datas.push_back(cd.data);
-        chol.compute(model, data, models, datas, mu);
-        cd.data = datas[0];
+        if (!std::isfinite(mu))
+            throw std::invalid_argument("ContactCholeskyDecomposition: mu must be finite");
+        if (mu < 0)
+            throw std::invalid_argument("ContactCholeskyDecomposition: mu must be nonnegative");
+        if (set.nq != model.nq || set.nv != model.nv)
+            throw std::invalid_argument("ContactCholeskyDecomposition: set topology does not match model");
+        if (set.count() > 0) {
+            if (set.revision() != last_revision_ || set.constraintDim() != last_constraint_dim_) {
+                chol.allocate(model, set.models);
+                last_revision_ = set.revision();
+                last_constraint_dim_ = set.constraintDim();
+            }
+            chol.compute(model, data, set.models, set.datas, mu);
+        }
     }
 
     val solve(const val& rhs_js) {
@@ -459,8 +648,8 @@ struct ContactCholeskyDecompositionEx {
 
 ContactCholeskyDecompositionEx* createContactCholeskyDecomposition(
     const Model& model,
-    const RigidConstraintModelEx& cm) {
-    return new ContactCholeskyDecompositionEx(model, cm);
+    const RigidConstraintSetEx& set) {
+    return new ContactCholeskyDecompositionEx(model, set);
 }
 
 // ─── Algorithm Wrappers ─────────────────────────────────────────
@@ -488,6 +677,22 @@ val crba_js(Model& model, Data& data, const val& q_js) {
     pinocchio::crba(model, data, q);
     data.M.triangularView<Eigen::StrictlyLower>() = data.M.transpose().triangularView<Eigen::StrictlyLower>();
     return matrixXdToJs(data.M);
+}
+
+void setKinematicMetric_js(Data& data, const val& diagonal_js) {
+    VectorXd diagonal = jsToVectorXd(diagonal_js);
+    const Eigen::Index nv = data.M.rows();
+
+    if (diagonal.size() != nv)
+        throw std::invalid_argument("setKinematicMetric: diagonal.length must equal model.nv (got " + std::to_string(diagonal.size()) + ", expected " + std::to_string(nv) + ")");
+
+    for (Eigen::Index i = 0; i < nv; ++i)
+        if (!std::isfinite(diagonal[i]))
+            throw std::invalid_argument("setKinematicMetric: diagonal contains non-finite value at index " + std::to_string(i));
+
+    data.M.setZero();
+    for (Eigen::Index i = 0; i < nv; ++i)
+        data.M(i, i) = diagonal[i];
 }
 
 double computeKineticEnergy_js(Model& model, Data& data, const val& q_js, const val& v_js) {
@@ -571,31 +776,299 @@ val neutralConfiguration_js(const Model& model) {
     return vectorXdToJs(q);
 }
 
+val integrate_js(const Model& model, const val& q_js, const val& v_js) {
+    VectorXd q = jsToVectorXd(q_js);
+    VectorXd v = jsToVectorXd(v_js);
+
+    if (q.size() != model.nq)
+        throw std::invalid_argument("integrate: q.length must equal model.nq (got " + std::to_string(q.size()) + ", expected " + std::to_string(model.nq) + ")");
+    if (v.size() != model.nv)
+        throw std::invalid_argument("integrate: v.length must equal model.nv (got " + std::to_string(v.size()) + ", expected " + std::to_string(model.nv) + ")");
+
+    for (Eigen::Index i = 0; i < q.size(); ++i)
+        if (!std::isfinite(q[i]))
+            throw std::invalid_argument("integrate: q contains non-finite value at index " + std::to_string(i));
+    for (Eigen::Index i = 0; i < v.size(); ++i)
+        if (!std::isfinite(v[i]))
+            throw std::invalid_argument("integrate: v contains non-finite value at index " + std::to_string(i));
+
+    VectorXd qout(model.nq);
+    pinocchio::integrate(model, q, v, qout);
+    return vectorXdToJs(qout);
+}
+
+val integrateScaled_js(const Model& model, const val& q_js, const val& v_js, double scale) {
+    VectorXd q = jsToVectorXd(q_js);
+    VectorXd v = jsToVectorXd(v_js);
+
+    if (q.size() != model.nq)
+        throw std::invalid_argument("integrate: q.length must equal model.nq (got " + std::to_string(q.size()) + ", expected " + std::to_string(model.nq) + ")");
+    if (v.size() != model.nv)
+        throw std::invalid_argument("integrate: v.length must equal model.nv (got " + std::to_string(v.size()) + ", expected " + std::to_string(model.nv) + ")");
+
+    for (Eigen::Index i = 0; i < q.size(); ++i)
+        if (!std::isfinite(q[i]))
+            throw std::invalid_argument("integrate: q contains non-finite value at index " + std::to_string(i));
+    for (Eigen::Index i = 0; i < v.size(); ++i)
+        if (!std::isfinite(v[i]))
+            throw std::invalid_argument("integrate: v contains non-finite value at index " + std::to_string(i));
+
+    if (!std::isfinite(scale))
+        throw std::invalid_argument("integrate: scale is non-finite");
+
+    v *= scale;
+    VectorXd qout(model.nq);
+    pinocchio::integrate(model, q, v, qout);
+    return vectorXdToJs(qout);
+}
+
+val difference_js(const Model& model, const val& q0_js, const val& q1_js) {
+    VectorXd q0 = jsToVectorXd(q0_js);
+    VectorXd q1 = jsToVectorXd(q1_js);
+
+    if (q0.size() != model.nq)
+        throw std::invalid_argument("difference: q0.length must equal model.nq (got " + std::to_string(q0.size()) + ", expected " + std::to_string(model.nq) + ")");
+    if (q1.size() != model.nq)
+        throw std::invalid_argument("difference: q1.length must equal model.nq (got " + std::to_string(q1.size()) + ", expected " + std::to_string(model.nq) + ")");
+
+    for (Eigen::Index i = 0; i < q0.size(); ++i) {
+        if (!std::isfinite(q0[i]))
+            throw std::invalid_argument("difference: q0 contains non-finite value at index " + std::to_string(i));
+        if (!std::isfinite(q1[i]))
+            throw std::invalid_argument("difference: q1 contains non-finite value at index " + std::to_string(i));
+    }
+
+    VectorXd dvout(model.nv);
+    pinocchio::difference(model, q0, q1, dvout);
+    return vectorXdToJs(dvout);
+}
+
+val differenceScaled_js(const Model& model, const val& q0_js, const val& q1_js, double scale) {
+    VectorXd q0 = jsToVectorXd(q0_js);
+    VectorXd q1 = jsToVectorXd(q1_js);
+
+    if (q0.size() != model.nq)
+        throw std::invalid_argument("difference: q0.length must equal model.nq (got " + std::to_string(q0.size()) + ", expected " + std::to_string(model.nq) + ")");
+    if (q1.size() != model.nq)
+        throw std::invalid_argument("difference: q1.length must equal model.nq (got " + std::to_string(q1.size()) + ", expected " + std::to_string(model.nq) + ")");
+
+    for (Eigen::Index i = 0; i < q0.size(); ++i) {
+        if (!std::isfinite(q0[i]))
+            throw std::invalid_argument("difference: q0 contains non-finite value at index " + std::to_string(i));
+        if (!std::isfinite(q1[i]))
+            throw std::invalid_argument("difference: q1 contains non-finite value at index " + std::to_string(i));
+    }
+
+    if (!std::isfinite(scale))
+        throw std::invalid_argument("difference: scale is non-finite");
+
+    VectorXd dvout(model.nv);
+    pinocchio::difference(model, q0, q1, dvout);
+    dvout *= scale;
+    return vectorXdToJs(dvout);
+}
+
+// ─── Configuration-space: interpolate / normalize / isNormalized ──
+
+val interpolate_js(const Model& model, const val& q0_js, const val& q1_js, double alpha) {
+    VectorXd q0 = jsToVectorXd(q0_js);
+    VectorXd q1 = jsToVectorXd(q1_js);
+
+    if (q0.size() != model.nq)
+        throw std::invalid_argument("interpolate: q0.length must equal model.nq (got " + std::to_string(q0.size()) + ", expected " + std::to_string(model.nq) + ")");
+    if (q1.size() != model.nq)
+        throw std::invalid_argument("interpolate: q1.length must equal model.nq (got " + std::to_string(q1.size()) + ", expected " + std::to_string(model.nq) + ")");
+
+    for (Eigen::Index i = 0; i < q0.size(); ++i) {
+        if (!std::isfinite(q0[i]))
+            throw std::invalid_argument("interpolate: q0 contains non-finite value at index " + std::to_string(i));
+        if (!std::isfinite(q1[i]))
+            throw std::invalid_argument("interpolate: q1 contains non-finite value at index " + std::to_string(i));
+    }
+
+    if (!std::isfinite(alpha))
+        throw std::invalid_argument("interpolate: alpha is non-finite");
+
+    VectorXd qout = pinocchio::interpolate(model, q0, q1, alpha);
+    return vectorXdToJs(qout);
+}
+
+val normalize_js(const Model& model, const val& q_js) {
+    VectorXd q = jsToVectorXd(q_js);
+
+    if (q.size() != model.nq)
+        throw std::invalid_argument("normalize: q.length must equal model.nq (got " + std::to_string(q.size()) + ", expected " + std::to_string(model.nq) + ")");
+
+    for (Eigen::Index i = 0; i < q.size(); ++i)
+        if (!std::isfinite(q[i]))
+            throw std::invalid_argument("normalize: q contains non-finite value at index " + std::to_string(i));
+
+    VectorXd qcopy = q;
+    pinocchio::normalize(model, qcopy);
+    return vectorXdToJs(qcopy);
+}
+
+bool isNormalized_js(const Model& model, const val& q_js) {
+    VectorXd q = jsToVectorXd(q_js);
+
+    if (q.size() != model.nq)
+        throw std::invalid_argument("isNormalized: q.length must equal model.nq (got " + std::to_string(q.size()) + ", expected " + std::to_string(model.nq) + ")");
+
+    for (Eigen::Index i = 0; i < q.size(); ++i)
+        if (!std::isfinite(q[i]))
+            throw std::invalid_argument("isNormalized: q contains non-finite value at index " + std::to_string(i));
+
+    return pinocchio::isNormalized(model, q, 1e-6);
+}
+
+bool isNormalizedPrec_js(const Model& model, const val& q_js, double precision) {
+    VectorXd q = jsToVectorXd(q_js);
+
+    if (q.size() != model.nq)
+        throw std::invalid_argument("isNormalized: q.length must equal model.nq (got " + std::to_string(q.size()) + ", expected " + std::to_string(model.nq) + ")");
+
+    for (Eigen::Index i = 0; i < q.size(); ++i)
+        if (!std::isfinite(q[i]))
+            throw std::invalid_argument("isNormalized: q contains non-finite value at index " + std::to_string(i));
+
+    if (!std::isfinite(precision))
+        throw std::invalid_argument("isNormalized: precision is non-finite");
+    if (precision <= 0)
+        throw std::invalid_argument("isNormalized: precision must be positive (got " + std::to_string(precision) + ")");
+
+    return pinocchio::isNormalized(model, q, precision);
+}
+
+// ─── solveSVD ────────────────────────────────────────────────────
+
+val solveSVD_impl(const val& A_js, int rows, int cols, const val& b_js,
+                  double lambda, double threshold) {
+    if (rows <= 0)
+        throw std::invalid_argument("solveSVD: rows must be positive (got " + std::to_string(rows) + ")");
+    if (cols <= 0)
+        throw std::invalid_argument("solveSVD: cols must be positive (got " + std::to_string(cols) + ")");
+
+    unsigned Alen = A_js["length"].as<unsigned>();
+    if (Alen != static_cast<unsigned>(rows * cols))
+        throw std::invalid_argument("solveSVD: A.length must equal rows * cols (got " + std::to_string(Alen) + ", expected " + std::to_string(rows * cols) + ")");
+
+    unsigned blen = b_js["length"].as<unsigned>();
+    if (blen != static_cast<unsigned>(rows))
+        throw std::invalid_argument("solveSVD: b.length must equal rows (got " + std::to_string(blen) + ", expected " + std::to_string(rows) + ")");
+
+    if (!std::isfinite(lambda))
+        throw std::invalid_argument("solveSVD: lambda is non-finite");
+    if (lambda < 0)
+        throw std::invalid_argument("solveSVD: lambda must be non-negative (got " + std::to_string(lambda) + ")");
+
+    if (!std::isfinite(threshold))
+        throw std::invalid_argument("solveSVD: threshold is non-finite");
+    if (threshold <= 0)
+        throw std::invalid_argument("solveSVD: threshold must be positive (got " + std::to_string(threshold) + ")");
+
+    Eigen::MatrixXd A_mat(rows, cols);
+    for (int j = 0; j < cols; ++j)
+        for (int i = 0; i < rows; ++i) {
+            double val = A_js[j * rows + i].as<double>();
+            if (!std::isfinite(val))
+                throw std::invalid_argument("solveSVD: A contains non-finite value at (" + std::to_string(i) + "," + std::to_string(j) + ")");
+            A_mat(i, j) = val;
+        }
+
+    Eigen::VectorXd b_vec(rows);
+    for (int i = 0; i < rows; ++i) {
+        double val = b_js[i].as<double>();
+        if (!std::isfinite(val))
+            throw std::invalid_argument("solveSVD: b contains non-finite value at index " + std::to_string(i));
+        b_vec(i) = val;
+    }
+
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(A_mat, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    Eigen::VectorXd svals = svd.singularValues();
+
+    int rank = 0;
+    for (Eigen::Index i = 0; i < svals.size(); ++i)
+        if (svals(i) > threshold) rank++;
+
+    double cond = std::numeric_limits<double>::infinity();
+    if (svals.size() > 0 && svals(svals.size() - 1) > 0)
+        cond = svals(0) / svals(svals.size() - 1);
+
+    Eigen::VectorXd x(cols);
+    if (svals.size() > 0) {
+        Eigen::VectorXd UTb = svd.matrixU().transpose() * b_vec;
+        Eigen::VectorXd damped(svals.size());
+        for (Eigen::Index i = 0; i < svals.size(); ++i) {
+            double s = svals(i);
+            double denom = s * s + lambda * lambda;
+            damped(i) = (denom > 0) ? (s / denom) * UTb(i) : 0.0;
+        }
+        x = svd.matrixV() * damped;
+    } else {
+        x.setZero();
+    }
+
+    val result = val::object();
+    result.set("x", vectorXdToJs(x));
+    result.set("rank", val(rank));
+    result.set("singularValues", vectorXdToJs(svals));
+    result.set("cond", val(cond));
+    return result;
+}
+
+val solveSVD_js(const val& A_js, int rows, int cols, const val& b_js) {
+    return solveSVD_impl(A_js, rows, cols, b_js, 0.0, 1e-6);
+}
+
+val solveSVD_full_js(const val& A_js, int rows, int cols, const val& b_js,
+                     double lambda, double threshold) {
+    return solveSVD_impl(A_js, rows, cols, b_js, lambda, threshold);
+}
+
 // ─── Constraint Dynamics Wrappers ────────────────────────────────
 
 void initConstraintDynamics_js(Model& model, Data& data,
-                               const RigidConstraintModelEx& cm) {
-    PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
-    models.push_back(cm);
-    pinocchio::initConstraintDynamics(model, data, models);
+                               const RigidConstraintSetEx& set) {
+    if (set.nq != model.nq || set.nv != model.nv)
+        throw std::invalid_argument("initConstraintDynamics: set topology does not match model");
+    if (set.count() > 0)
+        pinocchio::initConstraintDynamics(model, data, set.models);
 }
 
 val constraintDynamics_js(Model& model, Data& data,
                           const val& q_js, const val& v_js, const val& tau_js,
-                          const RigidConstraintModelEx& cm,
-                          RigidConstraintDataEx& cd,
+                          RigidConstraintSetEx& set,
                           ProximalSettings& settings) {
+    if (set.nq != model.nq || set.nv != model.nv)
+        throw std::invalid_argument("constraintDynamics: set topology does not match model");
+
     VectorXd q = jsToVectorXd(q_js);
     VectorXd v = jsToVectorXd(v_js);
     VectorXd tau = jsToVectorXd(tau_js);
 
-    PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintModel) models;
-    models.push_back(cm);
-    PINOCCHIO_STD_VECTOR_WITH_EIGEN_ALLOCATOR(RigidConstraintData) datas;
-    datas.push_back(cd.data);
+    if (q.size() != model.nq)
+        throw std::invalid_argument("constraintDynamics: q.length must equal model.nq (got " + std::to_string(q.size()) + ", expected " + std::to_string(model.nq) + ")");
+    if (v.size() != model.nv)
+        throw std::invalid_argument("constraintDynamics: v.length must equal model.nv (got " + std::to_string(v.size()) + ", expected " + std::to_string(model.nv) + ")");
+    if (tau.size() != model.nv)
+        throw std::invalid_argument("constraintDynamics: tau.length must equal model.nv (got " + std::to_string(tau.size()) + ", expected " + std::to_string(model.nv) + ")");
 
-    pinocchio::constraintDynamics(model, data, q, v, tau, models, datas, settings);
-    cd.data = datas[0];
+    for (Eigen::Index i = 0; i < q.size(); ++i)
+        if (!std::isfinite(q[i]))
+            throw std::invalid_argument("constraintDynamics: q contains non-finite value at index " + std::to_string(i));
+    for (Eigen::Index i = 0; i < v.size(); ++i)
+        if (!std::isfinite(v[i]))
+            throw std::invalid_argument("constraintDynamics: v contains non-finite value at index " + std::to_string(i));
+    for (Eigen::Index i = 0; i < tau.size(); ++i)
+        if (!std::isfinite(tau[i]))
+            throw std::invalid_argument("constraintDynamics: tau contains non-finite value at index " + std::to_string(i));
+
+    if (set.count() > 0) {
+        pinocchio::initConstraintDynamics(model, data, set.models);
+        pinocchio::constraintDynamics(model, data, q, v, tau, set.models, set.datas, settings);
+    } else {
+        pinocchio::aba(model, data, q, v, tau);
+    }
 
     return vectorXdToJs(data.ddq);
 }
@@ -611,6 +1084,7 @@ val dataComAt(const Data& data, unsigned idx) {
 
 val dataDDq(const Data& data) { return vectorXdToJs(data.ddq); }
 val dataLambdaC(const Data& data) { return vectorXdToJs(data.lambda_c); }
+val dataM(const Data& data) { return matrixXdToJs(data.M); }
 
 // ─── Embind Module ──────────────────────────────────────────────
 
@@ -679,6 +1153,7 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     function("getComAt", &dataComAt);
     function("getDDq", &dataDDq);
     function("getLambdaC", &dataLambdaC);
+    function("getM", &dataM);
 
     // ── RigidConstraintModel ──
     class_<RigidConstraintModelEx>("RigidConstraintModel")
@@ -695,15 +1170,19 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
 
     function("createRigidConstraintModel", &createRigidConstraintModel, allow_raw_pointers());
 
-    // ── RigidConstraintData ──
-    class_<RigidConstraintDataEx>("RigidConstraintData")
-        .constructor<>()
-        .property("c1Mc2", &RigidConstraintDataEx::getC1Mc2)
-        .property("c1Mc2Translation", &RigidConstraintDataEx::getC1Mc2Translation)
-        .property("contactForce", &RigidConstraintDataEx::getContactForce)
-        ;
-
-    function("createConstraintData", &makeRigidConstraintData);
+    class_<RigidConstraintSetEx>("RigidConstraintSet")
+        .constructor<const Model&>()
+        .function("addConstraint", &RigidConstraintSetEx::addConstraint)
+        .function("replaceConstraint", &RigidConstraintSetEx::replaceConstraint)
+        .function("getModel", &RigidConstraintSetEx::modelInfo)
+        .function("getData", &RigidConstraintSetEx::dataInfo)
+        .function("evaluate", &RigidConstraintSetEx::evaluate)
+        .function("updatePlacements", &RigidConstraintSetEx::updatePlacements)
+        .function("setConstraintGains", &RigidConstraintSetEx::setConstraintGains)
+        .property("count", &RigidConstraintSetEx::count)
+        .property("constraintDim", &RigidConstraintSetEx::constraintDim)
+        .property("revision", &RigidConstraintSetEx::revision)
+        .function("rowOffset", &RigidConstraintSetEx::rowOffset);
 
     // ── ProximalSettings ──
     class_<ProximalSettings>("ProximalSettings")
@@ -732,6 +1211,7 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     function("rnea", &rnea_js);
     function("aba", &aba_js);
     function("crba", &crba_js);
+    function("setKinematicMetric", &setKinematicMetric_js);
     function("computeKineticEnergy", &computeKineticEnergy_js);
     function("computePotentialEnergy", &computePotentialEnergy_js);
     function("computeGeneralizedGravity", &computeGeneralizedGravity_js);
@@ -746,8 +1226,20 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     function("computeTotalMass", &computeTotalMass_js);
     function("randomConfiguration", &randomConfiguration_js);
     function("neutralConfiguration", &neutralConfiguration_js);
+    function("integrate", &integrate_js);
+    function("integrate", &integrateScaled_js);
+    function("difference", &difference_js);
+    function("difference", &differenceScaled_js);
+    function("interpolate", &interpolate_js);
+    function("normalize", &normalize_js);
+    function("isNormalized", &isNormalized_js);
+    function("isNormalized", &isNormalizedPrec_js);
 
     // ── Constraint Algorithms ──
     function("initConstraintDynamics", &initConstraintDynamics_js);
     function("constraintDynamics", &constraintDynamics_js);
+
+    // ── SVD Solver ──
+    function("solveSVD", &solveSVD_js);
+    function("solveSVD", &solveSVD_full_js);
 }
