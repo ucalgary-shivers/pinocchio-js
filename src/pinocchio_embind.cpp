@@ -10,6 +10,7 @@
 #include <pinocchio/fwd.hpp>
 #include <pinocchio/multibody/model.hpp>
 #include <pinocchio/multibody/data.hpp>
+#include <pinocchio/multibody/frame.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/center-of-mass.hpp>
@@ -111,13 +112,13 @@ Eigen::Matrix<double,6,1> jsToVector6d(const val& arr) {
 }
 
 /**
- * Convert a flat 9-element JS array to Eigen::Matrix3d (row-major input).
+ * Convert a flat 9-element JS array to Eigen::Matrix3d (column-major input).
  */
 Matrix3d jsToMatrix3d(const val& arr) {
     Matrix3d m;
-    m(0,0) = arr[0].as<double>(); m(0,1) = arr[1].as<double>(); m(0,2) = arr[2].as<double>();
-    m(1,0) = arr[3].as<double>(); m(1,1) = arr[4].as<double>(); m(1,2) = arr[5].as<double>();
-    m(2,0) = arr[6].as<double>(); m(2,1) = arr[7].as<double>(); m(2,2) = arr[8].as<double>();
+    m(0,0) = arr[0].as<double>(); m(1,0) = arr[1].as<double>(); m(2,0) = arr[2].as<double>();
+    m(0,1) = arr[3].as<double>(); m(1,1) = arr[4].as<double>(); m(2,1) = arr[5].as<double>();
+    m(0,2) = arr[6].as<double>(); m(1,2) = arr[7].as<double>(); m(2,2) = arr[8].as<double>();
     return m;
 }
 
@@ -146,7 +147,7 @@ val se3ToJs(const SE3& se3) {
 // ─── SE3 Factories ──────────────────────────────────────────────
 
 /**
- * Create SE3 from rotation matrix (9 floats, row-major) + translation (3 floats).
+ * Create SE3 from rotation matrix (9 floats, column-major) + translation (3 floats).
  */
 SE3 se3FromRotationTranslation(const val& rot, const val& trans) {
     return SE3(jsToMatrix3d(rot), jsToVector3d(trans));
@@ -214,15 +215,19 @@ struct JointModelWrapper {
         PX, PY, PZ,
         REVOLUTE_UNALIGNED,
         PRISMATIC_UNALIGNED,
+        UNIVERSAL,
         FREE_FLYER,
         FIXED
     };
 
     Type type;
     Vector3d axis;
+    Vector3d axis2;
 
-    JointModelWrapper(Type t) : type(t), axis(Vector3d::UnitX()) {}
-    JointModelWrapper(Type t, const Vector3d& a) : type(t), axis(a.normalized()) {}
+    JointModelWrapper(Type t) : type(t), axis(Vector3d::UnitX()), axis2(Vector3d::UnitY()) {}
+    JointModelWrapper(Type t, const Vector3d& a) : type(t), axis(a.normalized()), axis2(Vector3d::UnitY()) {}
+    JointModelWrapper(const Vector3d& a1, const Vector3d& a2)
+    : type(UNIVERSAL), axis(a1), axis2(a2) {}
 };
 
 JointModelWrapper makeJointModelRX() { return JointModelWrapper(JointModelWrapper::RX); }
@@ -237,6 +242,18 @@ JointModelWrapper makeJointModelRevoluteUnaligned(double ax, double ay, double a
 }
 JointModelWrapper makeJointModelPrismaticUnaligned(double ax, double ay, double az) {
     return JointModelWrapper(JointModelWrapper::PRISMATIC_UNALIGNED, Vector3d(ax, ay, az));
+}
+JointModelWrapper makeJointModelUniversal(double x1, double y1, double z1,
+                                          double x2, double y2, double z2) {
+    const Vector3d axis1(x1, y1, z1);
+    const Vector3d axis2(x2, y2, z2);
+    constexpr double tolerance = 1e-12;
+    if (!axis1.allFinite() || !axis2.allFinite()
+        || std::abs(axis1.norm() - 1.0) > tolerance
+        || std::abs(axis2.norm() - 1.0) > tolerance
+        || std::abs(axis1.dot(axis2)) > tolerance)
+        throw std::invalid_argument("JointModelUniversal axes must be finite, unit-length, and orthogonal");
+    return JointModelWrapper(axis1, axis2);
 }
 JointModelWrapper makeJointModelFreeFlyer() { return JointModelWrapper(JointModelWrapper::FREE_FLYER); }
 JointModelWrapper makeJointModelFixed() { return JointModelWrapper(JointModelWrapper::FIXED); }
@@ -268,6 +285,10 @@ JointIndex modelAddJoint(Model& model,
         case JointModelWrapper::PRISMATIC_UNALIGNED:
             return model.addJoint(parentId,
                 pinocchio::JointModelPrismaticUnaligned(joint.axis),
+                placement, name);
+        case JointModelWrapper::UNIVERSAL:
+            return model.addJoint(parentId,
+                pinocchio::JointModelUniversal(joint.axis, joint.axis2),
                 placement, name);
         case JointModelWrapper::FREE_FLYER:
             return model.addJoint(parentId, pinocchio::JointModelFreeFlyer(), placement, name);
@@ -321,6 +342,10 @@ JointIndex modelAddJointWithLimits(Model& model,
             return model.addJoint(parentId,
                 pinocchio::JointModelPrismaticUnaligned(joint.axis),
                 placement, name, maxEffort, maxVelocity, minConfig, maxConfig);
+        case JointModelWrapper::UNIVERSAL:
+            return model.addJoint(parentId,
+                pinocchio::JointModelUniversal(joint.axis, joint.axis2),
+                placement, name, maxEffort, maxVelocity, minConfig, maxConfig);
         case JointModelWrapper::FREE_FLYER:
             return model.addJoint(parentId, pinocchio::JointModelFreeFlyer(), placement, name,
                                   maxEffort, maxVelocity, minConfig, maxConfig);
@@ -334,6 +359,20 @@ void modelAppendBodyToJoint(Model& model,
                             const Inertia& inertia,
                             const SE3& bodyPlacement) {
     model.appendBodyToJoint(jointId, inertia, bodyPlacement);
+}
+
+FrameIndex modelAddFrame(Model& model, const std::string& name,
+                         JointIndex parentJointId, const SE3& placement) {
+    if (parentJointId >= model.njoints)
+        throw std::invalid_argument("addFrame: parentJointId is out of range");
+    for (int i = 0; i < 3; ++i)
+        if (!std::isfinite(placement.translation()[i]))
+            throw std::invalid_argument("addFrame: placement contains non-finite values");
+    for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 3; ++col)
+            if (!std::isfinite(placement.rotation()(row, col)))
+                throw std::invalid_argument("addFrame: placement contains non-finite values");
+    return model.addFrame(pinocchio::Frame(name, parentJointId, placement, pinocchio::OP_FRAME));
 }
 
 // ─── RigidConstraintModel Wrapper ────────────────────────────────
@@ -390,7 +429,27 @@ RigidConstraintModelEx* createRigidConstraintModel(pinocchio::ContactType type,
                                                     const SE3& joint2_placement,
                                                     pinocchio::ReferenceFrame reference_frame) {
     return new RigidConstraintModelEx(type, model, joint1_id, joint1_placement,
-                                      joint2_id, joint2_placement, reference_frame);
+                                       joint2_id, joint2_placement, reference_frame);
+}
+
+RigidConstraintModelEx* createConstraintFromFrames(const Model& model,
+                                                    FrameIndex frameAId,
+                                                    FrameIndex frameBId,
+                                                    pinocchio::ContactType type,
+                                                    pinocchio::ReferenceFrame referenceFrame) {
+    if (frameAId >= model.nframes || frameBId >= model.nframes)
+        throw std::out_of_range("createConstraintFromFrames: frame ID is out of range");
+    if (type != pinocchio::CONTACT_3D && type != pinocchio::CONTACT_6D)
+        throw std::invalid_argument("createConstraintFromFrames supports CONTACT_3D and CONTACT_6D only");
+    if (referenceFrame != pinocchio::LOCAL && referenceFrame != pinocchio::LOCAL_WORLD_ALIGNED)
+        throw std::invalid_argument("createConstraintFromFrames supports LOCAL and LOCAL_WORLD_ALIGNED only");
+
+    const pinocchio::Frame& frameA = model.frames[frameAId];
+    const pinocchio::Frame& frameB = model.frames[frameBId];
+    return new RigidConstraintModelEx(type, model,
+                                      frameA.parentJoint, frameA.placement,
+                                      frameB.parentJoint, frameB.placement,
+                                      referenceFrame);
 }
 
 // The set is the ownership boundary for constraint algorithms.  In particular,
@@ -536,8 +595,15 @@ struct RigidConstraintSetEx {
                 }
             }
 
-            MatrixXd Jc(dim, cols);
-            models[i].jacobian(model, data, datas[i], Jc);
+			MatrixXd Jc = MatrixXd::Zero(dim, cols);
+			models[i].jacobian(model, data, datas[i], Jc);
+
+			if (models[i].reference_frame == pinocchio::LOCAL &&
+				models[i].type == pinocchio::CONTACT_6D) {
+				Eigen::Matrix<double, 6, 6> Jlog;
+				pinocchio::Jlog6(datas[i].c1Mc2, Jlog);
+				Jc = Jlog * Jc;
+			}
 
             double sign = (models[i].reference_frame == pinocchio::LOCAL) ? -1.0 : 1.0;
             for (int col = 0; col < cols; ++col)
@@ -637,7 +703,11 @@ struct ContactCholeskyDecompositionEx {
     }
 
     val solve(const val& rhs_js) {
+        if (chol.size() == 0)
+            throw std::logic_error("ContactCholeskyDecomposition: solve called before allocation/computation");
         VectorXd rhs = jsToVectorXd(rhs_js);
+        if (rhs.size() != static_cast<Eigen::Index>(chol.size()))
+            throw std::invalid_argument("ContactCholeskyDecomposition: rhs size " + std::to_string(rhs.size()) + " must equal decomposition size " + std::to_string(chol.size()));
         VectorXd result = chol.solve(rhs);
         return vectorXdToJs(result);
     }
@@ -686,9 +756,12 @@ void setKinematicMetric_js(Data& data, const val& diagonal_js) {
     if (diagonal.size() != nv)
         throw std::invalid_argument("setKinematicMetric: diagonal.length must equal model.nv (got " + std::to_string(diagonal.size()) + ", expected " + std::to_string(nv) + ")");
 
-    for (Eigen::Index i = 0; i < nv; ++i)
+    for (Eigen::Index i = 0; i < nv; ++i) {
         if (!std::isfinite(diagonal[i]))
             throw std::invalid_argument("setKinematicMetric: diagonal contains non-finite value at index " + std::to_string(i));
+        if (diagonal[i] <= 0)
+            throw std::invalid_argument("setKinematicMetric: diagonal must be strictly positive (got " + std::to_string(diagonal[i]) + " at index " + std::to_string(i) + ")");
+    }
 
     data.M.setZero();
     for (Eigen::Index i = 0; i < nv; ++i)
@@ -738,10 +811,18 @@ val getJointJacobian_js(const Model& model, Data& data,
 }
 
 val getFrameJacobian_js(const Model& model, Data& data,
-                         JointIndex jointId,
-                         const SE3& placement,
-                         pinocchio::ReferenceFrame refFrame) {
+                          JointIndex jointId,
+                          const SE3& placement,
+                          pinocchio::ReferenceFrame refFrame) {
     return matrixXdToJs(pinocchio::getFrameJacobian(model, data, jointId, placement, refFrame));
+}
+
+val getFrameJacobianById_js(const Model& model, Data& data,
+                            FrameIndex frameId,
+                            pinocchio::ReferenceFrame refFrame) {
+    MatrixXd J = MatrixXd::Zero(6, model.nv);
+    pinocchio::getFrameJacobian(model, data, frameId, refFrame, J);
+    return matrixXdToJs(J);
 }
 
 void updateFramePlacements_js(Model& model, Data& data) {
@@ -754,6 +835,10 @@ val getJointPlacement_js(const Data& data, JointIndex jointId) {
     result.set("translation", vector3dToJs(placement.translation()));
     result.set("rotation", matrixXdToJs(placement.rotation()));
     return result;
+}
+
+val getFramePlacement_js(const Data& data, FrameIndex frameId) {
+    return se3ToJs(data.oMf[frameId]);
 }
 
 val centerOfMass_js(Model& model, Data& data, const val& q_js) {
@@ -964,7 +1049,7 @@ val solveSVD_impl(const val& A_js, int rows, int cols, const val& b_js,
     if (!std::isfinite(threshold))
         throw std::invalid_argument("solveSVD: threshold is non-finite");
     if (threshold <= 0)
-        throw std::invalid_argument("solveSVD: threshold must be positive (got " + std::to_string(threshold) + ")");
+        throw std::invalid_argument("solveSVD: relative threshold must be positive (got " + std::to_string(threshold) + ")");
 
     Eigen::MatrixXd A_mat(rows, cols);
     for (int j = 0; j < cols; ++j)
@@ -987,8 +1072,11 @@ val solveSVD_impl(const val& A_js, int rows, int cols, const val& b_js,
     Eigen::VectorXd svals = svd.singularValues();
 
     int rank = 0;
-    for (Eigen::Index i = 0; i < svals.size(); ++i)
-        if (svals(i) > threshold) rank++;
+    if (svals.size() > 0) {
+        double rel_threshold = threshold * svals(0);
+        for (Eigen::Index i = 0; i < svals.size(); ++i)
+            if (svals(i) > rel_threshold) rank++;
+    }
 
     double cond = std::numeric_limits<double>::infinity();
     if (svals.size() > 0 && svals(svals.size() - 1) > 0)
@@ -1127,6 +1215,7 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     function("JointModelPZ", &makeJointModelPZ);
     function("JointModelRevoluteUnaligned", &makeJointModelRevoluteUnaligned);
     function("JointModelPrismaticUnaligned", &makeJointModelPrismaticUnaligned);
+    function("JointModelUniversal", &makeJointModelUniversal);
     function("JointModelFreeFlyer", &makeJointModelFreeFlyer);
     function("JointModelFixed", &makeJointModelFixed);
 
@@ -1142,6 +1231,7 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     function("addJoint", &modelAddJoint);
     function("addJointWithLimits", &modelAddJointWithLimits);
     function("appendBodyToJoint", &modelAppendBodyToJoint);
+    function("addFrame", &modelAddFrame);
 
     // ── Data ──
     class_<Data>("Data")
@@ -1169,6 +1259,7 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
         ;
 
     function("createRigidConstraintModel", &createRigidConstraintModel, allow_raw_pointers());
+    function("createConstraintFromFrames", &createConstraintFromFrames, allow_raw_pointers());
 
     class_<RigidConstraintSetEx>("RigidConstraintSet")
         .constructor<const Model&>()
@@ -1219,9 +1310,11 @@ EMSCRIPTEN_BINDINGS(pinocchio_wasm) {
     function("forwardKinematics", &forwardKinematics_js);
     function("updateFramePlacements", &updateFramePlacements_js);
     function("getJointPlacement", &getJointPlacement_js);
+    function("getFramePlacement", &getFramePlacement_js);
     function("computeJointJacobians", &computeJointJacobians_js);
     function("getJointJacobian", &getJointJacobian_js);
     function("getFrameJacobian", &getFrameJacobian_js);
+    function("getFrameJacobian", &getFrameJacobianById_js);
     function("centerOfMass", &centerOfMass_js);
     function("computeTotalMass", &computeTotalMass_js);
     function("randomConfiguration", &randomConfiguration_js);
