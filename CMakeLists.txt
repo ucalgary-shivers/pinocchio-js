@@ -100,6 +100,10 @@ target_compile_definitions(pinocchio_wasm PRIVATE
 # Emscripten-specific flags
 # ─────────────────────────────────────────────
 if(EMSCRIPTEN)
+  # Pinocchio 3.9 marks its constraint API unsupported while the interface
+  # evolves. This WASM target explicitly binds that API and has one source.
+  target_compile_options(pinocchio_wasm PRIVATE -Wno-deprecated-declarations)
+
   set_target_properties(pinocchio_wasm PROPERTIES
     OUTPUT_NAME "pinocchio"
     SUFFIX ".js"

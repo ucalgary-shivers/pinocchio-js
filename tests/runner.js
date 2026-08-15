@@ -87,6 +87,7 @@ async function main() {
         'test_math.js',
         'test_model.js',
         'test_algo.js',
+        'test_constraints.js',
         'test_urdf.js'
     ];
 
@@ -104,7 +105,7 @@ async function main() {
             console.log('');
         } catch (err) {
             console.error(`${RED}❌ Error running ${file}:${RESET}`, err);
-            // Create stub file if missing? No, that's what I'll do next.
+            totalFailed++;
             if (err.code === 'MODULE_NOT_FOUND') {
                 console.warn(`${YELLOW}   (File not created yet)${RESET}\n`);
             }
