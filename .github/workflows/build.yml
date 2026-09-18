@@ -46,6 +46,25 @@ jobs:
           ref: emscripten-libs-22
           path: llvm-project
 
+      - name: Build OpenMP
+        run: |
+            mkdir -p build-openmp && cd build-openmp
+            # CMake options from https://github.com/emscripten-core/emscripten/blob/6.0.9/system/lib/update_openmp.py#L64
+            emcmake cmake \
+              ../llvm-project/runtimes \
+              -DLLVM_ENABLE_RUNTIMES=openmp \
+              -DLLVM_DEFAULT_TARGET_TRIPLE=wasm32-unknown-emscripten \
+              -DOPENMP_ENABLE_LIBOMPTARGET=OFF \
+              -DLIBOMP_HAVE_OMPT_SUPPORT=OFF \
+              -DLIBOMP_OMPT_SUPPORT=OFF \
+              -DLIBOMP_OMPD_SUPPORT=OFF \
+              -DLIBOMP_USE_DEBUGGER=OFF \
+              -DLIBOMP_FORTRAN_MODULES=OFF \
+              -DLIBOMP_ENABLE_SHARED=OFF \
+              -DLIBOMP_ARCH=wasm32 \
+              -DOPENMP_ENABLE_LIBOMPTARGET_PROFILING=OFF
+            emmake make openmp -j$(nproc)
+
       - name: Build WASM
         run: |
           mkdir -p build && cd build
