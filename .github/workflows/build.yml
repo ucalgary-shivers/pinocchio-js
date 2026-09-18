@@ -64,6 +64,7 @@ jobs:
               -DLIBOMP_ARCH=wasm32 \
               -DOPENMP_ENABLE_LIBOMPTARGET_PROFILING=OFF
             emmake make openmp -j$(nproc)
+            ls -lh openmp/runtime/src/libomp.a
 
       - name: Build WASM
         run: |
