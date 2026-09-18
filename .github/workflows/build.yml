@@ -31,7 +31,7 @@ jobs:
         run: npm install
 
       - name: Setup Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
+        uses: emscripten-core/setup-emsdk@v16
         with:
           version: 3.1.64
           actions-cache-folder: 'emsdk-cache'
