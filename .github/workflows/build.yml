@@ -63,7 +63,7 @@ jobs:
               -DLIBOMP_ENABLE_SHARED=OFF \
               -DLIBOMP_ARCH=wasm32 \
               -DOPENMP_ENABLE_LIBOMPTARGET_PROFILING=OFF
-            emmake make openmp -j$(nproc)
+            emmake make omp -j$(nproc)
             ls -lh openmp/runtime/src/libomp.a
 
       - name: Build WASM
