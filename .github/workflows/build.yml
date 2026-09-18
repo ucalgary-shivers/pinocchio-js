@@ -39,6 +39,13 @@ jobs:
       - name: Verify Emscripten
         run: emcc -v
 
+      - name: Checkout emscripten llvm-project for OpenMP
+        uses: actions/checkout@v7
+        with:
+          repository: emscripten-core/llvm-project
+          ref: emscripten-libs-22
+          path: llvm-project
+
       - name: Build WASM
         run: |
           mkdir -p build && cd build
