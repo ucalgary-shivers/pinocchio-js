@@ -46,7 +46,7 @@ set(BUILD_WITH_COLLISION_SUPPORT OFF CACHE BOOL "" FORCE)
 set(BUILD_WITH_AUTODIFF_SUPPORT OFF CACHE BOOL "" FORCE)
 set(BUILD_WITH_CASADI_SUPPORT OFF CACHE BOOL "" FORCE)
 if(NOT BUILD_WITH_OPENMP_SUPPORT)
-set(BUILD_WITH_OPENMP_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(BUILD_WITH_OPENMP_SUPPORT OFF CACHE BOOL "" FORCE)
 endif()
 set(BUILD_WITH_EXTRA_SUPPORT OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -133,6 +133,19 @@ if(EMSCRIPTEN)
   target_compile_options(pinocchio_wasm PRIVATE
     -msimd128                  # WASM SIMD for Eigen vectorization
   )
+
+  if(BUILD_WITH_OPENMP_SUPPORT)
+    target_compile_options(pinocchio_wasm PRIVATE
+      -fopenmp=libomp 
+      -pthread
+    )
+    target_link_options(pinocchio_wasm PRIVATE
+      -sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency # https://emscripten.org/docs/porting/pthreads.html
+    )
+    target_link_libraries(pinocchio_wasm PRIVATE
+      ${OPENMP_BUILD_DIR}/openmp/runtime/src/libomp.a
+    )
+  endif()
 
   target_link_options(pinocchio_wasm PRIVATE
     --bind # Enable Embind
