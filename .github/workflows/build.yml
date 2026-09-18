@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: stack-of-tasks/pinocchio
-          ref: v2.7.1
+          ref: v3.0.0
           path: pinocchio
 
       - name: Setup Node.js
@@ -31,20 +31,48 @@ jobs:
         run: npm install
 
       - name: Setup Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
+        uses: emscripten-core/setup-emsdk@v16
         with:
-          version: 3.1.64
+          version: 6.0.9
           actions-cache-folder: 'emsdk-cache'
 
       - name: Verify Emscripten
         run: emcc -v
+
+      - name: Checkout emscripten llvm-project for OpenMP
+        uses: actions/checkout@v7
+        with:
+          repository: emscripten-core/llvm-project
+          ref: emscripten-libs-22
+          path: llvm-project
+
+      - name: Build OpenMP
+        run: |
+            mkdir -p build-openmp && cd build-openmp
+            # CMake options from https://github.com/emscripten-core/emscripten/blob/6.0.9/system/lib/update_openmp.py#L64
+            emcmake cmake \
+              ../llvm-project/runtimes \
+              -DLLVM_ENABLE_RUNTIMES=openmp \
+              -DLLVM_DEFAULT_TARGET_TRIPLE=wasm32-unknown-emscripten \
+              -DOPENMP_ENABLE_LIBOMPTARGET=OFF \
+              -DLIBOMP_HAVE_OMPT_SUPPORT=OFF \
+              -DLIBOMP_OMPT_SUPPORT=OFF \
+              -DLIBOMP_OMPD_SUPPORT=OFF \
+              -DLIBOMP_USE_DEBUGGER=OFF \
+              -DLIBOMP_FORTRAN_MODULES=OFF \
+              -DLIBOMP_ENABLE_SHARED=OFF \
+              -DLIBOMP_ARCH=wasm32 \
+              -DOPENMP_ENABLE_LIBOMPTARGET_PROFILING=OFF
+            emmake make omp -j$(nproc)
+            ls -lh openmp/runtime/src/libomp.a
 
       - name: Build WASM
         run: |
           mkdir -p build && cd build
           emcmake cmake .. \
             -DCMAKE_BUILD_TYPE=MinSizeRel \
-            -DPINOCCHIO_SOURCE_DIR=$(pwd)/../pinocchio
+            -DPINOCCHIO_SOURCE_DIR=$(pwd)/../pinocchio \
+            -DOPENMP_BUILD_DIR=$(pwd)/../build-openmp
           emmake make -j$(nproc)
 
       - name: Run Tests

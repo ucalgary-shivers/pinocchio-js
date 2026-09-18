@@ -18,6 +18,24 @@ endif()
 
 message(STATUS "Pinocchio source dir: ${PINOCCHIO_SOURCE_DIR}")
 
+option(BUILD_WITH_OPENMP_SUPPORT "Build with OpenMP support" OFF)
+# ─────────────────────────────────────────────
+# Path to the emscripten-core/llvm-project OpenMP build directory
+# Override with: cmake .. -DOPENMP_BUILD_DIR=/path/to/openmp
+# ─────────────────────────────────────────────
+if(DEFINED OPENMP_BUILD_DIR)
+  if(EXISTS "${OPENMP_BUILD_DIR}/openmp/runtime/src/libomp.a")
+    message(STATUS "OpenMP emscripten-core/llvm-project build dir: ${OPENMP_BUILD_DIR}")
+    set(BUILD_WITH_OPENMP_SUPPORT ON CACHE BOOL "" FORCE)
+  else()
+    message(FATAL_ERROR "${OPENMP_BUILD_DIR} does not exist or does not contain openmp/runtime/src/libomp.a. Please update OPENMP_BUILD_DIR with the right path to the emscripten-core/llvm-project build dir that contains openmp/runtime/src/libomp.a.")
+  endif()
+else()
+  if(BUILD_WITH_OPENMP_SUPPORT)
+    message(FATAL_ERROR "Please define OPENMP_BUILD_DIR with the path to the emscripten-core/llvm-project build dir that contains openmp/runtime/src/libomp.a OR turn BUILD_WITH_OPENMP_SUPPORT OFF.")
+  endif()
+endif()
+
 # ─────────────────────────────────────────────
 # Pinocchio build options — disable everything we don't need
 # ─────────────────────────────────────────────
@@ -27,7 +45,9 @@ set(BUILD_WITH_SDF_SUPPORT OFF CACHE BOOL "" FORCE)
 set(BUILD_WITH_COLLISION_SUPPORT OFF CACHE BOOL "" FORCE)
 set(BUILD_WITH_AUTODIFF_SUPPORT OFF CACHE BOOL "" FORCE)
 set(BUILD_WITH_CASADI_SUPPORT OFF CACHE BOOL "" FORCE)
-set(BUILD_WITH_OPENMP_SUPPORT OFF CACHE BOOL "" FORCE)
+if(NOT BUILD_WITH_OPENMP_SUPPORT)
+  set(BUILD_WITH_OPENMP_SUPPORT OFF CACHE BOOL "" FORCE)
+endif()
 set(BUILD_WITH_EXTRA_SUPPORT OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
@@ -113,6 +133,19 @@ if(EMSCRIPTEN)
   target_compile_options(pinocchio_wasm PRIVATE
     -msimd128                  # WASM SIMD for Eigen vectorization
   )
+
+  if(BUILD_WITH_OPENMP_SUPPORT)
+    target_compile_options(pinocchio_wasm PRIVATE
+      -fopenmp=libomp 
+      -pthread
+    )
+    target_link_options(pinocchio_wasm PRIVATE
+      -sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency # https://emscripten.org/docs/porting/pthreads.html
+    )
+    target_link_libraries(pinocchio_wasm PRIVATE
+      ${OPENMP_BUILD_DIR}/openmp/runtime/src/libomp.a
+    )
+  endif()
 
   target_link_options(pinocchio_wasm PRIVATE
     --bind # Enable Embind
