@@ -72,6 +72,7 @@ jobs:
           emcmake cmake .. \
             -DCMAKE_BUILD_TYPE=MinSizeRel \
             -DPINOCCHIO_SOURCE_DIR=$(pwd)/../pinocchio
+            -DOPENMP_BUILD_DIR=$(pwd)/../build-openmp
           emmake make -j$(nproc)
 
       - name: Run Tests
