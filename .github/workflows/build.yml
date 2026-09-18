@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: stack-of-tasks/pinocchio
-          ref: v2.7.1
+          ref: v3.0.0
           path: pinocchio
 
       - name: Setup Node.js
